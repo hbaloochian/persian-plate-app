@@ -29,32 +29,50 @@ jobs:
       - name: 1. دریافت کد پروژه (Checkout)
         uses: actions/checkout@v4
 
-      - name: 2. تنظیم Java JDK 17 (مورد نیاز Android Gradle)
+      - name: 2. آزادسازی فضای دیسک سرور (جلوگیری از خطای No space left on device)
+        run: |
+          echo "=== فضای دیسک قبل از پاک‌سازی ==="
+          df -h /
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /opt/ghc \
+            /usr/local/.ghcup \
+            /usr/share/swift \
+            /usr/local/share/boost \
+            /usr/local/share/powershell \
+            /opt/hostedtoolcache/CodeQL \
+            /opt/az \
+            /usr/local/julia*
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          echo "=== فضای دیسک بعد از پاک‌سازی ==="
+          df -h /
+
+      - name: 3. تنظیم Java JDK 17 (مورد نیاز Android Gradle)
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
 
-      - name: 3. نصب و کش مدیر بسته فوق‌سریع uv + پایتون 3.13
+      - name: 4. نصب و کش مدیر بسته فوق‌سریع uv + پایتون 3.13
         uses: astral-sh/setup-uv@v6
         with:
           python-version: "3.13"
           enable-cache: true
           cache-dependency-glob: "pyproject.toml"
 
-      - name: 4. نصب وابستگی‌های توسعه و اجرای تست‌های خودکار
+      - name: 5. نصب وابستگی‌های توسعه و اجرای تست‌های خودکار
         run: |
           uv sync --group dev
           uv run pytest -v
 
-      - name: 5. استخراج نسخه دقیق Flutter مورد نیاز Flet
+      - name: 6. استخراج نسخه دقیق Flutter مورد نیاز Flet
         id: flet_meta
         run: |
           FLUTTER_VER=$(uv run python -c "import flet.version; print(flet.version.flutter_version)")
           echo "flutter_version=${FLUTTER_VER}" >> "$GITHUB_OUTPUT"
           echo "Required Flutter SDK version: ${FLUTTER_VER}"
 
-      - name: 6. نصب و کش Flutter SDK (افزایش چشمگیر سرعت بیلدهای بعدی)
+      - name: 7. نصب و کش Flutter SDK (افزایش چشمگیر سرعت بیلدهای بعدی)
         uses: subosito/flutter-action@v2
         with:
           flutter-version: ${{ steps.flet_meta.outputs.flutter_version }}
@@ -62,7 +80,7 @@ jobs:
           cache: true
           cache-key: "flutter-:os:-:channel:-:version:-:arch:"
 
-      - name: 7. کش Gradle، Pub، Flet و چرخ‌های اندروید (Multi-Layer Cache)
+      - name: 8. کش Gradle، Pub، Flet و چرخ‌های اندروید (Multi-Layer Cache)
         uses: actions/cache@v4
         with:
           path: |
@@ -76,7 +94,7 @@ jobs:
             ${{ runner.os }}-flet-android-${{ steps.flet_meta.outputs.flutter_version }}-
             ${{ runner.os }}-flet-android-
 
-      - name: 8. کش اختیاری مدل‌های ONNX (در صورت فعال بودن تبدیل خودکار)
+      - name: 9. کش اختیاری مدل‌های ONNX (در صورت فعال بودن تبدیل خودکار)
         if: ${{ inputs.auto_export_onnx == true }}
         id: onnx_cache
         uses: actions/cache@v4
@@ -84,14 +102,19 @@ jobs:
           path: src/weights/*.onnx
           key: yolo26-persian-plate-onnx-v1
 
-      - name: 9. تبدیل خودکار مدل‌های .pt به .onnx (فقط در صورت درخواست و نبود در کش)
+      - name: 10. تبدیل خودکار مدل‌های .pt به .onnx با نسخه سبک CPU (فقط در صورت درخواست و نبود در کش)
         if: ${{ inputs.auto_export_onnx == true && steps.onnx_cache.outputs.cache-hit != 'true' }}
         run: |
-          uv run --with ultralytics --with onnx --with onnxslim python scripts/export_onnx.py \
+          trap 'rm -rf /tmp/onnx-export-venv' EXIT
+          uv venv /tmp/onnx-export-venv --python 3.13
+          uv pip install --python /tmp/onnx-export-venv/bin/python \
+            --no-cache --torch-backend=cpu \
+            ultralytics onnx onnxslim
+          /tmp/onnx-export-venv/bin/python scripts/export_onnx.py \
             --download-from-github \
             --output-dir src/weights
 
-      - name: 10. همگام‌سازی و بررسی پوشه weights
+      - name: 11. همگام‌سازی و بررسی پوشه weights
         run: |
           mkdir -p src/weights
           if [ -d "weights" ] && ls weights/*.onnx >/dev/null 2>&1; then
@@ -103,17 +126,19 @@ jobs:
             echo "::warning::هیچ فایل .onnx در src/weights یافت نشد! APK ساخته می‌شود اما برای تشخیص پلاک باید فایل‌های ONNX را در src/weights قرار دهید."
           fi
 
-      - name: 11. پذیرش خودکار لایسنس‌های Android SDK
+      - name: 12. پذیرش خودکار لایسنس‌های Android SDK
         run: |
           if [ -n "${ANDROID_HOME:-}" ] && [ -x "${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager" ]; then
             yes | "${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null 2>&1 || true
           fi
 
-      - name: 12. ساخت فایل نصبی اندروید (Release APK)
+      - name: 13. ساخت فایل نصبی اندروید (Release APK)
         run: |
+          echo "=== فضای آزاد دیسک قبل از ساخت APK ==="
+          df -h /
           uv run flet build apk --yes --verbose
 
-      - name: 13. آپلود فایل APK نهایی برای دانلود مستقیم
+      - name: 14. آپلود فایل APK نهایی برای دانلود مستقیم
         uses: actions/upload-artifact@v4
         with:
           name: persian-plate-scanner-android-apk
