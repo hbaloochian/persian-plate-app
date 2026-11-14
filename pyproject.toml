@@ -1,0 +1,58 @@
+[project]
+name = "persian-plate-scanner"
+version = "1.0.0"
+description = "اپلیکیشن اندروید تشخیص زنده پلاک خودرو با هوش مصنوعی محلی ONNX و ثبت تخلف"
+readme = "README.md"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+    "flet>=1.0.0",
+    "flet-camera>=0.1.0",
+    "flet-permission-handler>=0.1.0",
+    "onnxruntime>=1.20.0",
+    "numpy>=2.0.0",
+    "pillow>=11.0.0",
+    "httpx>=0.27.0",
+]
+
+[dependency-groups]
+dev = [
+    "flet[all]>=1.0.0",
+    "pytest>=8.0.0",
+]
+
+[tool.flet]
+org = "com.plateai"
+product = "پلاک‌خوان هوشمند"
+company = "PlateAI"
+copyright = "Copyright (C) 2026"
+compile.app = true
+compile.packages = false
+compile.cleanup = true
+
+[tool.flet.app]
+path = "src"
+
+[tool.flet.android]
+# onnxruntime روی pypi.flet.dev برای معماری 64 بیتی (arm64-v8a) ارائه شده است؛
+# این معماری بیش از 98% گوشی‌های اندرویدی مدرن را پوشش می‌دهد و حجم APK و زمان بیلد را 3 برابر کمتر می‌کند.
+target_arch = ["arm64-v8a"]
+min_sdk_version = 24
+target_sdk_version = 35
+split_per_abi = false
+extract_packages = ["onnxruntime"]
+
+[tool.flet.android.manifest_application]
+# اجازه ارسال درخواست HTTP بدون رمزنگاری (برای دامنه http://myweb.web.com)
+usesCleartextTraffic = "true"
+allowBackup = "false"
+
+[tool.flet.android.permission]
+"android.permission.INTERNET" = true
+"android.permission.CAMERA" = true
+# حذف مجوزهای ذخیره‌سازی اضافی که ممکن است توسط پلاگین دوربین اضافه شوند
+"android.permission.READ_EXTERNAL_STORAGE" = false
+"android.permission.WRITE_EXTERNAL_STORAGE" = false
+
+[tool.flet.android.feature]
+"android.hardware.camera" = true
+"android.hardware.camera.autofocus" = false
