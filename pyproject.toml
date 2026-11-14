@@ -40,6 +40,7 @@ min_sdk_version = 24
 target_sdk_version = 35
 split_per_abi = false
 extract_packages = ["onnxruntime"]
+adaptive_icon_background = "#0065A0"
 
 [tool.flet.android.manifest_application]
 # اجازه ارسال درخواست HTTP بدون رمزنگاری (برای دامنه http://myweb.web.com)
@@ -56,3 +57,11 @@ allowBackup = "false"
 [tool.flet.android.feature]
 "android.hardware.camera" = true
 "android.hardware.camera.autofocus" = false
+
+[tool.flet.android.gradle_properties]
+# محدودسازی منطقی حافظه Gradle و Kotlin برای جلوگیری از خطای OOM (exit code 143) روی سرورهای GitHub Actions و سیستم‌های 8GB
+"org.gradle.jvmargs" = "-Xmx3G -XX:MaxMetaspaceSize=1G -XX:ReservedCodeCacheSize=256m -Dfile.encoding=UTF-8"
+"kotlin.compiler.execution.strategy" = "in-process"
+"org.gradle.workers.max" = 2
+"org.gradle.parallel" = false
+"org.gradle.vfs.watch" = false

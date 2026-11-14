@@ -1,4 +1,4 @@
-"""کلاینت غیرهمزمان ارتباط با API سرور myweb.web.com با کش هوشمند و ثبت تخلف."""
+"""کلاینت غیرهمزمان ارتباط با API سرور myweb.web.com با کش هوشمند، ثبت تخلف و مدیریت تاریخچه محلی."""
 
 from __future__ import annotations
 
@@ -7,9 +7,11 @@ import base64
 import json
 import logging
 import time
-from dataclasses import dataclass, field
+import uuid
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -54,6 +56,182 @@ class ViolationSubmissionResult:
     message: str
     saved_locally: bool = False
     server_response: str = ""
+    record_id: str = ""
+
+
+@dataclass(slots=True)
+class ViolationRecord:
+    """ساختار هر رکورد تخلف ثبت‌شده برای نمایش در صفحه بازبینی تخلفات و ارسال مجدد."""
+
+    id: str
+    plate: str
+    plate_latin: str
+    violation_type: str
+    description: str
+    timestamp: str
+    local_time: str = ""
+    has_image: bool = False
+    has_evidence_image: bool = False
+    plate_image_file: str | None = None
+    evidence_image_file: str | None = None
+    synced: bool = False
+    server_response: str = ""
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any], fallback_index: int = 0) -> "ViolationRecord":
+        raw_ts = str(data.get("timestamp") or "")
+        local_time = str(data.get("local_time") or "")
+        if not local_time and raw_ts:
+            local_time = raw_ts.replace("T", " ")[:19]
+        return cls(
+            id=str(data.get("id") or f"legacy-{fallback_index}"),
+            plate=str(data.get("plate") or "---"),
+            plate_latin=str(data.get("plate_latin") or ""),
+            violation_type=str(data.get("violation_type") or "تخلف ثبت‌شده"),
+            description=str(data.get("description") or ""),
+            timestamp=raw_ts,
+            local_time=local_time,
+            has_image=bool(data.get("has_image", False)),
+            has_evidence_image=bool(data.get("has_evidence_image", False)),
+            plate_image_file=(
+                str(data["plate_image_file"]) if data.get("plate_image_file") else None
+            ),
+            evidence_image_file=(
+                str(data["evidence_image_file"]) if data.get("evidence_image_file") else None
+            ),
+            synced=bool(data.get("synced", False)),
+            server_response=str(data.get("server_response") or ""),
+        )
+
+
+def get_violation_log_file() -> Path:
+    """مسیر فایل JSONL تاریخچه تخلفات."""
+    return get_writable_data_dir() / "violations_log.jsonl"
+
+
+def get_violation_images_dir() -> Path:
+    """پوشه نگهداری تصاویر برش پلاک و مستندات تخلفات ثبت‌شده."""
+    path = get_writable_data_dir() / "violation_images"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def save_violation_image_bytes(filename: str, image_bytes: bytes | None) -> str | None:
+    """ذخیره امن تصویر JPEG در پوشه تصاویر تخلفات."""
+    if not image_bytes:
+        return None
+    safe_name = Path(filename).name
+    try:
+        dest = get_violation_images_dir() / safe_name
+        dest.write_bytes(image_bytes)
+        return safe_name
+    except OSError as exc:
+        logger.warning("Could not save violation image '%s': %s", safe_name, exc)
+        return None
+
+
+def read_violation_image_bytes(filename: str | None) -> bytes | None:
+    """خواندن بایت‌های تصویر ذخیره‌شده یک تخلف از حافظه محلی."""
+    if not filename:
+        return None
+    safe_name = Path(filename).name
+    path = get_violation_images_dir() / safe_name
+    if not path.is_file():
+        return None
+    try:
+        return path.read_bytes()
+    except OSError as exc:
+        logger.warning("Could not read violation image '%s': %s", safe_name, exc)
+        return None
+
+
+def load_violation_records() -> list[ViolationRecord]:
+    """فهرست تخلفات ثبت‌شده را از جدیدترین به قدیمی‌ترین بارگذاری می‌کند."""
+    log_file = get_violation_log_file()
+    if not log_file.is_file():
+        return []
+
+    records: list[ViolationRecord] = []
+    try:
+        lines = log_file.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        logger.warning("Could not read violations log: %s", exc)
+        return []
+
+    for idx, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            parsed = json.loads(stripped)
+            if isinstance(parsed, dict):
+                records.append(ViolationRecord.from_dict(parsed, fallback_index=idx))
+        except json.JSONDecodeError:
+            logger.warning("Skipping malformed violation log line %d", idx + 1)
+
+    records.reverse()
+    return records
+
+
+def _rewrite_violation_records(records_oldest_first: list[ViolationRecord]) -> bool:
+    log_file = get_violation_log_file()
+    try:
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        with log_file.open("w", encoding="utf-8") as fh:
+            for rec in records_oldest_first:
+                fh.write(json.dumps(asdict(rec), ensure_ascii=False) + "\n")
+        return True
+    except OSError as exc:
+        logger.warning("Could not rewrite violations log: %s", exc)
+        return False
+
+
+def delete_violation_record(record_id: str) -> bool:
+    """یک رکورد تخلف و تصاویر مرتبط با آن را از حافظه محلی حذف می‌کند."""
+    records_newest = load_violation_records()
+    target: ViolationRecord | None = None
+    remaining: list[ViolationRecord] = []
+    for rec in records_newest:
+        if rec.id == record_id and target is None:
+            target = rec
+        else:
+            remaining.append(rec)
+
+    if target is None:
+        return False
+
+    # بازگرداندن ترتیب قدیمی به جدید برای ذخیره در JSONL
+    remaining.reverse()
+    ok = _rewrite_violation_records(remaining)
+    if ok:
+        img_dir = get_violation_images_dir()
+        for fname in (target.plate_image_file, target.evidence_image_file):
+            if fname:
+                try:
+                    (img_dir / Path(fname).name).unlink(missing_ok=True)
+                except OSError:
+                    pass
+    return ok
+
+
+def update_violation_sync_status(
+    record_id: str,
+    synced: bool,
+    server_response: str = "",
+) -> bool:
+    """وضعیت همگام‌سازی یک رکورد تخلف را در فایل محلی به‌روزرسانی می‌کند."""
+    records_newest = load_violation_records()
+    updated = False
+    for rec in records_newest:
+        if rec.id == record_id:
+            rec.synced = synced
+            rec.server_response = server_response
+            updated = True
+            break
+    if not updated:
+        return False
+    records_newest.reverse()
+    return _rewrite_violation_records(records_newest)
 
 
 def parse_server_plate_response(
@@ -250,51 +428,130 @@ class PlateApiClient:
         violation_type: str,
         description: str,
         plate_crop_jpeg: bytes | None = None,
+        evidence_image_jpeg: bytes | None = None,
     ) -> ViolationSubmissionResult:
-        """گزارش تخلف را به سرور myweb.web.com ارسال و هم‌زمان یک نسخه محلی ذخیره می‌کند."""
-        record = {
+        """گزارش تخلف (همراه با تصویر برش پلاک و تصویر مستندات) را به سرور ارسال و در حافظه محلی ذخیره می‌کند."""
+        record_id = f"v-{datetime.now().strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:6]}"
+        iso_ts = datetime.now(timezone.utc).isoformat()
+        local_time = datetime.now().strftime("%Y/%m/%d - %H:%M:%S")
+
+        plate_img_file = save_violation_image_bytes(f"{record_id}_plate.jpg", plate_crop_jpeg)
+        evidence_img_file = save_violation_image_bytes(
+            f"{record_id}_evidence.jpg",
+            evidence_image_jpeg,
+        )
+
+        payload: dict[str, Any] = {
+            "id": record_id,
             "plate": plate_persian,
             "plate_latin": plate_latin,
             "violation_type": violation_type,
             "description": description.strip(),
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": iso_ts,
             "has_image": plate_crop_jpeg is not None,
+            "has_evidence_image": evidence_image_jpeg is not None,
         }
-        saved_locally = self._append_local_log(record)
-
-        payload = dict(record)
         if plate_crop_jpeg:
             payload["image_base64"] = base64.b64encode(plate_crop_jpeg).decode("ascii")
+        if evidence_image_jpeg:
+            payload["evidence_image_base64"] = base64.b64encode(evidence_image_jpeg).decode("ascii")
+
+        synced = False
+        server_response = ""
+        message = ""
+        try:
+            client = self._get_client()
+            resp = await client.post(self.settings.violation_url, json=payload)
+            server_response = resp.text.strip()
+            if 200 <= resp.status_code < 300:
+                synced = True
+                message = "تخلف با موفقیت در سرور ثبت شد."
+            else:
+                message = f"خطای سرور هنگام ثبت تخلف (کد {resp.status_code}). نسخه محلی ذخیره شد."
+        except Exception as exc:
+            logger.warning("Failed to submit violation online: %s", exc)
+            server_response = str(exc)
+            message = "اتصال به سرور برقرار نشد؛ تخلف به‌صورت محلی روی گوشی ذخیره شد."
+
+        record = ViolationRecord(
+            id=record_id,
+            plate=plate_persian,
+            plate_latin=plate_latin,
+            violation_type=violation_type,
+            description=description.strip(),
+            timestamp=iso_ts,
+            local_time=local_time,
+            has_image=plate_crop_jpeg is not None,
+            has_evidence_image=evidence_image_jpeg is not None,
+            plate_image_file=plate_img_file,
+            evidence_image_file=evidence_img_file,
+            synced=synced,
+            server_response=server_response,
+        )
+        saved_locally = self._append_local_log(asdict(record))
+
+        return ViolationSubmissionResult(
+            success=synced,
+            message=message,
+            saved_locally=saved_locally,
+            server_response=server_response,
+            record_id=record_id,
+        )
+
+    async def retry_violation_sync(self, record: ViolationRecord) -> ViolationSubmissionResult:
+        """ارسال مجدد یک تخلف ذخیره‌شده محلی به سرور myweb.web.com."""
+        plate_bytes = read_violation_image_bytes(record.plate_image_file)
+        evidence_bytes = read_violation_image_bytes(record.evidence_image_file)
+
+        payload: dict[str, Any] = {
+            "id": record.id,
+            "plate": record.plate,
+            "plate_latin": record.plate_latin,
+            "violation_type": record.violation_type,
+            "description": record.description,
+            "timestamp": record.timestamp,
+            "has_image": plate_bytes is not None,
+            "has_evidence_image": evidence_bytes is not None,
+        }
+        if plate_bytes:
+            payload["image_base64"] = base64.b64encode(plate_bytes).decode("ascii")
+        if evidence_bytes:
+            payload["evidence_image_base64"] = base64.b64encode(evidence_bytes).decode("ascii")
 
         try:
             client = self._get_client()
             resp = await client.post(self.settings.violation_url, json=payload)
+            server_response = resp.text.strip()
             if 200 <= resp.status_code < 300:
+                update_violation_sync_status(record.id, synced=True, server_response=server_response)
                 return ViolationSubmissionResult(
                     success=True,
-                    message="تخلف با موفقیت در سرور ثبت شد.",
-                    saved_locally=saved_locally,
-                    server_response=resp.text.strip(),
+                    message="تخلف با موفقیت به سرور ارسال و همگام‌سازی شد.",
+                    saved_locally=True,
+                    server_response=server_response,
+                    record_id=record.id,
                 )
             return ViolationSubmissionResult(
                 success=False,
-                message=f"خطای سرور هنگام ثبت تخلف (کد {resp.status_code}). نسخه محلی ذخیره شد.",
-                saved_locally=saved_locally,
-                server_response=resp.text.strip(),
+                message=f"سرور پاسخ خطا داد (کد {resp.status_code}).",
+                saved_locally=True,
+                server_response=server_response,
+                record_id=record.id,
             )
         except Exception as exc:
-            logger.warning("Failed to submit violation online: %s", exc)
+            logger.warning("Retry violation sync failed: %s", exc)
             return ViolationSubmissionResult(
                 success=False,
-                message="اتصال به سرور برقرار نشد؛ تخلف به‌صورت محلی روی گوشی ذخیره شد.",
-                saved_locally=saved_locally,
+                message=f"ارسال مجدد ناموفق بود: {exc}",
+                saved_locally=True,
                 server_response=str(exc),
+                record_id=record.id,
             )
 
     @staticmethod
     def _append_local_log(record: dict[str, Any]) -> bool:
         try:
-            log_file = get_writable_data_dir() / "violations_log.jsonl"
+            log_file = get_violation_log_file()
             with log_file.open("a", encoding="utf-8") as fh:
                 fh.write(json.dumps(record, ensure_ascii=False) + "\n")
             return True

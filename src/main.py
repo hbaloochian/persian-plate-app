@@ -3,8 +3,10 @@
 ساختار صفحه اصلی:
 - بخش بالا (55% صفحه): نمایش زنده دوربین گوشی + رسم کادرهای رنگی (آبی -> قرمز/سبز)
 - بخش پایین (45% صفحه):
-    1) حالت پیش‌فرض: نمایش گرافیکی پلاک، اطلاعات دریافتی از سرور myweb.web.com و دکمه «ثبت تخلف»
-    2) حالت ثبت تخلف: پس از لمس دکمه «ثبت تخلف»، بخش پایینی به فرم ثبت تخلف تغییر می‌کند.
+    1) حالت پیش‌فرض: نمایش گرافیکی استاندارد پلاک ایران، اطلاعات دریافتی از سرور myweb.web.com
+       و دکمه‌های «ثبت تخلف» و «بازبینی تخلفات»
+    2) حالت ثبت تخلف: فرم ثبت تخلف همراه با پیوست تصویر برش‌خورده پلاک و عکس مستندات (دوربین/گالری)
+    3) حالت بازبینی تخلفات: فهرست تخلفات ثبت‌شده با امکان مشاهده تصاویر، ارسال مجدد و حذف
 """
 
 from __future__ import annotations
@@ -17,7 +19,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from PIL import Image
+from PIL import Image, ImageOps
 import flet as ft
 import flet.canvas as cv
 import flet_camera as fc
@@ -31,12 +33,21 @@ if str(SRC_DIR) not in sys.path:
 from config import AppSettings, to_persian_digits
 from core.geometry import compute_android_rotation_degrees, rotate_pil_clockwise
 from core.plate_detector import FrameInferenceResult, PersianPlateEngine, PlateDetection
-from services.api_client import ApiCheckResult, PlateApiClient, PlateCheckStatus
+from services.api_client import (
+    ApiCheckResult,
+    PlateApiClient,
+    PlateCheckStatus,
+    ViolationRecord,
+    delete_violation_record,
+    load_violation_records,
+    read_violation_image_bytes,
+)
 from ui.components import (
     build_iranian_plate_widget,
     build_overlay_shapes,
     status_to_badge_info,
 )
+from ui.violation_history_panel import ViolationHistoryPanel
 from ui.violation_panel import ViolationRegistrationPanel
 
 logging.basicConfig(
@@ -68,13 +79,17 @@ class AppRuntimeState:
     fps: float = 0.0
     last_inference_ms: float = 0.0
 
+    # آخرین فریم خام دوربین (جهت پشتیبان گرفتن عکس مستندات در صورت نیاز)
+    last_raw_frame_bytes: bytes | None = None
+    last_raw_frame_rotation: int = 0
+
     # آخرین تشخیص‌ها و وضعیت سرور برای هر پلاک
     active_plates: list[PlateDetection] = field(default_factory=list)
     plate_statuses: dict[str, PlateCheckStatus] = field(default_factory=dict)
     selected_plate: PlateDetection | None = None
     last_api_result: ApiCheckResult | None = None
 
-    # حالت بخش پایینی صفحه: "info" یا "violation"
+    # حالت بخش پایینی صفحه: "info" | "violation" | "history"
     bottom_mode: str = "info"
 
 
@@ -86,6 +101,32 @@ def _device_orientation_to_degrees(orientation: ft.DeviceOrientation | None) -> 
     if orientation == ft.DeviceOrientation.LANDSCAPE_LEFT:
         return 270
     return 0
+
+
+def _normalize_evidence_jpeg(
+    raw_bytes: bytes,
+    rotation_degrees: int = 0,
+    max_side: int = 1600,
+    quality: int = 85,
+) -> bytes:
+    """تصویر مستندات را با اصلاح جهت EXIF و بهینه‌سازی ابعاد به JPEG استاندارد تبدیل می‌کند."""
+    with Image.open(io.BytesIO(raw_bytes)) as img:
+        oriented = ImageOps.exif_transpose(img)
+        rgb = oriented.convert("RGB")
+    if rotation_degrees:
+        rgb = rotate_pil_clockwise(rgb, rotation_degrees)
+    rgb.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
+    buf = io.BytesIO()
+    rgb.save(buf, format="JPEG", quality=quality, optimize=True)
+    return buf.getvalue()
+
+
+def _create_demo_jpeg(color: tuple[int, int, int], size: tuple[int, int] = (320, 120)) -> bytes:
+    """تصویر نمونه سبک برای آزمایش رابط کاربری در حالت پیش‌نمایش دسکتاپ."""
+    img = Image.new("RGB", size, color=color)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=85)
+    return buf.getvalue()
 
 
 async def main(page: ft.Page) -> None:
@@ -102,6 +143,9 @@ async def main(page: ft.Page) -> None:
     engine = PersianPlateEngine(settings=settings)
     api_client = PlateApiClient(settings=settings)
     permission_handler = fph.PermissionHandler()
+    file_picker = ft.FilePicker()
+    if hasattr(page, "services"):
+        page.services.append(file_picker)
 
     # -----------------------------------------------------------------------
     # کنترل‌های بخش بالای صفحه (دوربین زنده + کادرهای Canvas + نوار HUD)
@@ -247,7 +291,7 @@ async def main(page: ft.Page) -> None:
     )
 
     # -----------------------------------------------------------------------
-    # کنترل‌های بخش پایین صفحه (نمایش اطلاعات سرور <-> صفحه ثبت تخلف)
+    # کنترل‌های بخش پایین صفحه (اطلاعات سرور <-> ثبت تخلف <-> بازبینی تخلفات)
     # -----------------------------------------------------------------------
     plate_widget_holder = ft.Container(
         content=build_iranian_plate_widget([], PlateCheckStatus.PENDING)
@@ -299,19 +343,38 @@ async def main(page: ft.Page) -> None:
     register_violation_btn = ft.FilledButton(
         content=ft.Row(
             alignment=ft.MainAxisAlignment.CENTER,
-            spacing=8,
+            spacing=6,
             controls=[
-                ft.Icon(ft.Icons.REPORT_PROBLEM, size=20),
-                ft.Text("ثبت تخلف", size=15, weight=ft.FontWeight.BOLD),
+                ft.Icon(ft.Icons.REPORT_PROBLEM, size=19),
+                ft.Text("ثبت تخلف", size=14, weight=ft.FontWeight.BOLD),
             ],
         ),
         style=ft.ButtonStyle(
             bgcolor=ft.Colors.RED_600,
             color=ft.Colors.WHITE,
             shape=ft.RoundedRectangleBorder(radius=12),
-            padding=ft.Padding.symmetric(vertical=14),
+            padding=ft.Padding.symmetric(horizontal=10, vertical=13),
         ),
-        width=float("inf"),
+        expand=3,
+    )
+
+    review_violations_label = ft.Text("بازبینی تخلفات", size=13, weight=ft.FontWeight.BOLD)
+    review_violations_btn = ft.FilledButton(
+        content=ft.Row(
+            alignment=ft.MainAxisAlignment.CENTER,
+            spacing=6,
+            controls=[
+                ft.Icon(ft.Icons.HISTORY, size=19),
+                review_violations_label,
+            ],
+        ),
+        style=ft.ButtonStyle(
+            bgcolor=ft.Colors.BLUE_GREY_700,
+            color=ft.Colors.WHITE,
+            shape=ft.RoundedRectangleBorder(radius=12),
+            padding=ft.Padding.symmetric(horizontal=10, vertical=13),
+        ),
+        expand=2,
     )
 
     server_info_view = ft.Container(
@@ -324,7 +387,13 @@ async def main(page: ft.Page) -> None:
                 plate_widget_holder,
                 status_chip,
                 server_info_card,
-                register_violation_btn,
+                ft.Row(
+                    spacing=8,
+                    controls=[
+                        register_violation_btn,
+                        review_violations_btn,
+                    ],
+                ),
             ],
         ),
     )
@@ -339,6 +408,18 @@ async def main(page: ft.Page) -> None:
                 bgcolor=ft.Colors.RED_700 if is_error else ft.Colors.GREEN_700,
             )
         )
+
+    async def refresh_violation_counter(update_ui: bool = True) -> list[ViolationRecord]:
+        records = await asyncio.to_thread(load_violation_records)
+        count = len(records)
+        review_violations_label.value = (
+            f"بازبینی تخلفات ({to_persian_digits(str(count))})"
+            if count > 0
+            else "بازبینی تخلفات"
+        )
+        if update_ui and state.bottom_mode == "info":
+            review_violations_label.update()
+        return records
 
     def refresh_overlay_boxes() -> None:
         mirror_x = (
@@ -424,19 +505,103 @@ async def main(page: ft.Page) -> None:
     def switch_to_violation_view(_e=None) -> None:
         state.bottom_mode = "violation"
         plate_text = state.selected_plate.display_text if state.selected_plate else ""
-        has_crop = (
-            state.selected_plate is not None
-            and state.selected_plate.plate_crop_jpeg is not None
+        crop_bytes = (
+            state.selected_plate.plate_crop_jpeg
+            if state.selected_plate is not None
+            else None
         )
-        violation_panel.prepare(plate_display=plate_text, has_crop=has_crop)
+        violation_panel.prepare(
+            plate_display=plate_text,
+            has_crop=crop_bytes is not None,
+            plate_crop_bytes=crop_bytes,
+        )
         bottom_section_container.content = violation_panel
         bottom_section_container.update()
+
+    async def handle_capture_evidence_photo() -> bytes | None:
+        """ثبت عکس مستندات از دوربین زنده (با پشتیبان آخرین فریم دوربین در صورت محدودیت سخت‌افزاری)."""
+        if state.is_camera_ready:
+            was_streaming = state.is_streaming
+            prev_paused = state.is_paused
+            state.is_paused = True
+            captured_bytes: bytes | None = None
+            try:
+                if was_streaming:
+                    try:
+                        await camera_control.stop_image_stream()
+                        state.is_streaming = False
+                    except Exception as exc:
+                        logger.warning("Could not pause stream before take_picture: %s", exc)
+
+                raw_photo = await camera_control.take_picture()
+                if raw_photo:
+                    captured_bytes = await asyncio.to_thread(_normalize_evidence_jpeg, raw_photo, 0)
+            except Exception as exc:
+                logger.warning("take_picture failed, falling back to latest stream frame: %s", exc)
+                if state.last_raw_frame_bytes:
+                    try:
+                        captured_bytes = await asyncio.to_thread(
+                            _normalize_evidence_jpeg,
+                            state.last_raw_frame_bytes,
+                            state.last_raw_frame_rotation,
+                        )
+                    except Exception as fallback_exc:
+                        logger.warning("Fallback frame encoding failed: %s", fallback_exc)
+            finally:
+                if was_streaming and not state.is_streaming:
+                    try:
+                        await camera_control.start_image_stream()
+                        state.is_streaming = True
+                    except Exception as exc:
+                        logger.warning("Could not resume image stream after take_picture: %s", exc)
+                state.is_paused = prev_paused
+
+            if captured_bytes:
+                show_snackbar("عکس مستندات با دوربین ثبت شد.")
+                return captured_bytes
+            show_snackbar("ثبت عکس با دوربین ناموفق بود؛ می‌توانید از گالری انتخاب کنید.", is_error=True)
+            return None
+
+        # در حالت پیش‌نمایش دسکتاپ یک تصویر مستندات نمونه تولید می‌شود
+        demo_bytes = await asyncio.to_thread(_create_demo_jpeg, (36, 72, 118), (640, 360))
+        show_snackbar("تصویر نمونه مستندات در حالت شبیه‌ساز دسکتاپ ثبت شد.")
+        return demo_bytes
+
+    async def handle_pick_evidence_photo() -> bytes | None:
+        """انتخاب تصویر مستندات از گالری گوشی یا فایل‌های سیستم."""
+        try:
+            files = await file_picker.pick_files(
+                dialog_title="انتخاب تصویر مستندات تخلف",
+                file_type=ft.FilePickerFileType.IMAGE,
+                allow_multiple=False,
+                with_data=True,
+            )
+            if not files:
+                return None
+
+            selected = files[0]
+            raw_bytes: bytes | None = selected.bytes
+            if not raw_bytes and selected.path:
+                raw_bytes = await asyncio.to_thread(Path(selected.path).read_bytes)
+
+            if not raw_bytes:
+                show_snackbar("خواندن فایل تصویر انتخاب‌شده ممکن نشد.", is_error=True)
+                return None
+
+            normalized = await asyncio.to_thread(_normalize_evidence_jpeg, raw_bytes, 0)
+            show_snackbar("تصویر مستندات از گالری انتخاب شد.")
+            return normalized
+        except Exception as exc:
+            logger.warning("Gallery image picker error: %s", exc)
+            show_snackbar(f"خطا در انتخاب تصویر از گالری: {exc}", is_error=True)
+            return None
 
     async def handle_violation_submit(
         plate_text: str,
         violation_type: str,
         notes: str,
         attach_crop: bool,
+        evidence_bytes: bytes | None,
     ) -> None:
         plate_latin = state.selected_plate.plate_latin if state.selected_plate else ""
         crop_bytes = (
@@ -450,16 +615,162 @@ async def main(page: ft.Page) -> None:
             violation_type=violation_type,
             description=notes,
             plate_crop_jpeg=crop_bytes,
+            evidence_image_jpeg=evidence_bytes,
         )
+        await refresh_violation_counter(update_ui=False)
         show_snackbar(result.message, is_error=not result.success)
         if result.success or result.saved_locally:
             switch_to_info_view()
 
+    async def reload_history_panel() -> None:
+        records = await refresh_violation_counter(update_ui=False)
+        violation_history_panel.set_records(records)
+        if state.bottom_mode == "history":
+            bottom_section_container.update()
+
+    async def switch_to_history_view(_e=None) -> None:
+        state.bottom_mode = "history"
+        records = await refresh_violation_counter(update_ui=False)
+        violation_history_panel.set_records(records)
+        bottom_section_container.content = violation_history_panel
+        bottom_section_container.update()
+
+    async def open_violation_detail_dialog(record: ViolationRecord) -> None:
+        """نمایش جزئیات کامل یک تخلف ثبت‌شده شامل تصویر برش پلاک، عکس مستندات، ارسال مجدد و حذف."""
+        plate_bytes = await asyncio.to_thread(read_violation_image_bytes, record.plate_image_file)
+        evidence_bytes = await asyncio.to_thread(
+            read_violation_image_bytes,
+            record.evidence_image_file,
+        )
+
+        detail_controls: list[ft.Control] = [
+            _info_row("پلاک", record.plate),
+            _info_row("نوع تخلف", record.violation_type, value_color=ft.Colors.AMBER_300),
+            _info_row("زمان ثبت", to_persian_digits(record.local_time or "---")),
+            _info_row(
+                "وضعیت ارسال",
+                "ارسال‌شده به سرور" if record.synced else "ذخیره‌شده روی گوشی (ارسال‌نشده)",
+                value_color=ft.Colors.GREEN_400 if record.synced else ft.Colors.ORANGE_300,
+            ),
+        ]
+        if record.description:
+            detail_controls.append(_info_row("توضیحات", record.description))
+        if record.server_response:
+            detail_controls.append(_info_row("پاسخ سرور", record.server_response[:160]))
+
+        if plate_bytes:
+            detail_controls.extend(
+                [
+                    ft.Divider(height=10, color=ft.Colors.BLUE_GREY_800),
+                    ft.Text("تصویر برش‌خورده پلاک:", size=12, weight=ft.FontWeight.BOLD),
+                    ft.Container(
+                        alignment=ft.Alignment.CENTER,
+                        bgcolor=ft.Colors.BLACK,
+                        border_radius=ft.BorderRadius.all(8),
+                        padding=ft.Padding.all(4),
+                        content=ft.Image(
+                            src=plate_bytes,
+                            height=85,
+                            fit=ft.BoxFit.CONTAIN,
+                            border_radius=ft.BorderRadius.all(6),
+                        ),
+                    ),
+                ]
+            )
+
+        if evidence_bytes:
+            detail_controls.extend(
+                [
+                    ft.Divider(height=10, color=ft.Colors.BLUE_GREY_800),
+                    ft.Text("تصویر مستندات تخلف:", size=12, weight=ft.FontWeight.BOLD),
+                    ft.Container(
+                        alignment=ft.Alignment.CENTER,
+                        bgcolor=ft.Colors.BLACK,
+                        border_radius=ft.BorderRadius.all(8),
+                        padding=ft.Padding.all(4),
+                        content=ft.Image(
+                            src=evidence_bytes,
+                            height=180,
+                            fit=ft.BoxFit.CONTAIN,
+                            border_radius=ft.BorderRadius.all(6),
+                        ),
+                    ),
+                ]
+            )
+
+        if not plate_bytes and not evidence_bytes:
+            detail_controls.append(
+                ft.Text(
+                    "تصویری برای این تخلف پیوست نشده است.",
+                    size=11,
+                    color=ft.Colors.WHITE_60,
+                )
+            )
+
+        async def handle_retry_sync(_ev) -> None:
+            page.pop_dialog()
+            res = await api_client.retry_violation_sync(record)
+            show_snackbar(res.message, is_error=not res.success)
+            await reload_history_panel()
+
+        async def handle_delete(_ev) -> None:
+            page.pop_dialog()
+            deleted = await asyncio.to_thread(delete_violation_record, record.id)
+            show_snackbar(
+                "گزارش تخلف حذف شد." if deleted else "حذف گزارش ناموفق بود.",
+                is_error=not deleted,
+            )
+            await reload_history_panel()
+
+        dialog_actions: list[ft.Control] = [
+            ft.TextButton(
+                "حذف",
+                style=ft.ButtonStyle(color=ft.Colors.RED_400),
+                on_click=handle_delete,
+            ),
+        ]
+        if not record.synced:
+            dialog_actions.append(
+                ft.FilledButton(
+                    "ارسال مجدد به سرور",
+                    style=ft.ButtonStyle(bgcolor=ft.Colors.BLUE_700, color=ft.Colors.WHITE),
+                    on_click=handle_retry_sync,
+                )
+            )
+        dialog_actions.append(
+            ft.FilledButton("بستن", on_click=lambda _: page.pop_dialog())
+        )
+
+        page.show_dialog(
+            ft.AlertDialog(
+                title=ft.Text("جزئیات تخلف ثبت‌شده"),
+                content=ft.Container(
+                    width=340,
+                    content=ft.Column(
+                        tight=True,
+                        spacing=8,
+                        scroll=ft.ScrollMode.AUTO,
+                        controls=detail_controls,
+                    ),
+                ),
+                actions=dialog_actions,
+            )
+        )
+
     violation_panel = ViolationRegistrationPanel(
         on_back=switch_to_info_view,
         on_submit=handle_violation_submit,
+        on_capture_evidence=handle_capture_evidence_photo,
+        on_pick_evidence=handle_pick_evidence_photo,
     )
+    violation_history_panel = ViolationHistoryPanel(
+        on_back=switch_to_info_view,
+        on_refresh=reload_history_panel,
+        on_select_record=open_violation_detail_dialog,
+    )
+
     register_violation_btn.on_click = switch_to_violation_view
+    review_violations_btn.on_click = switch_to_history_view
 
     bottom_section_container = ft.Container(
         expand=4,
@@ -544,6 +855,9 @@ async def main(page: ft.Page) -> None:
                         state.selected_camera.lens_direction == fc.CameraLensDirection.FRONT
                     ),
                 )
+
+            state.last_raw_frame_bytes = frame_bytes
+            state.last_raw_frame_rotation = rotation_deg
 
             result = await asyncio.to_thread(_decode_and_infer_sync, frame_bytes, rotation_deg)
             state.last_inference_ms = result.inference_ms
@@ -646,15 +960,17 @@ async def main(page: ft.Page) -> None:
     # حالت تست شبیه‌سازی برای اجرا روی کامپیوتر (دسکتاپ) بدون دوربین اندروید
     # -----------------------------------------------------------------------
     async def run_demo_detection(is_no: bool) -> None:
-        demo_chars = ["1", "2", "ب", "3", "4", "5", "6", "7"]
+        demo_chars = ["1", "2", "ب", "3", "4", "5", "1", "1"]
+        demo_crop = await asyncio.to_thread(_create_demo_jpeg, (235, 238, 245), (280, 72))
         demo_plate = PlateDetection(
             norm_box=(0.2, 0.38, 0.8, 0.56),
             pixel_box=(128, 180, 512, 270),
             confidence=0.94,
             plate_persian="".join(demo_chars),
-            plate_latin="12B34567",
+            plate_latin="12B34511",
             chars_persian=demo_chars,
             complete=True,
+            plate_crop_jpeg=demo_crop,
         )
         state.active_plates = [demo_plate]
         state.selected_plate = demo_plate
@@ -706,7 +1022,7 @@ async def main(page: ft.Page) -> None:
         if not is_mobile_or_web:
             camera_placeholder_text.value = (
                 "حالت دسکتاپ: دوربین زنده Flet روی اندروید و iOS فعال است.\n"
-                "برای بررسی رنگ کادرها (آبی → قرمز/سبز) و فرم ثبت تخلف از دکمه‌های زیر استفاده کنید:"
+                "برای بررسی رنگ کادرها (آبی → قرمز/سبز)، ثبت تخلف و بازبینی تخلفات از دکمه‌های زیر استفاده کنید:"
             )
             desktop_demo_controls.visible = True
             hud_status_text.value = "حالت پیش‌نمایش دسکتاپ"
@@ -777,7 +1093,10 @@ async def main(page: ft.Page) -> None:
     retry_camera_btn.on_click = init_camera_pipeline
 
     async def bootstrap_app() -> None:
-        # 1. بارگذاری غیرهمزمان مدل‌های ONNX در ترد جداگانه تا رابط کاربری قفل نشود
+        # 1. بارگذاری شمارنده تخلفات ثبت‌شده قبلی
+        await refresh_violation_counter(update_ui=False)
+
+        # 2. بارگذاری غیرهمزمان مدل‌های ONNX در ترد جداگانه تا رابط کاربری قفل نشود
         loaded = await asyncio.to_thread(engine.load)
         if loaded:
             mode_label = "تک‌مرحله‌ای" if engine.single_stage_mode else "دومرحله‌ای YOLO26"
@@ -790,7 +1109,7 @@ async def main(page: ft.Page) -> None:
                 ]
         page.update()
 
-        # 2. فعال‌سازی دوربین زنده گوشی
+        # 3. فعال‌سازی دوربین زنده گوشی
         await init_camera_pipeline()
 
     # -----------------------------------------------------------------------

@@ -132,16 +132,65 @@ def build_iranian_plate_widget(
     chars_persian: list[str],
     status: PlateCheckStatus,
 ) -> ft.Container:
-    """نمایش گرافیکی پلاک استاندارد خودروهای ایران با حاشیه رنگی متناسب با وضعیت سرور."""
+    """نمایش گرافیکی پلاک استاندارد خودروهای ایران با حاشیه رنگی متناسب با وضعیت سرور.
+
+    چیدمان صحیح پلاک ایران (از راست به چپ در صفحه RTL، و از چپ به راست به‌صورت دیداری):
+    - سمت راست: کادر «ایران» و کد ۲ رقمی شهر
+    - خط جداکننده عمودی
+    - وسط (راست به چپ): ۳ رقم ← حرف فارسی ← ۲ رقم
+    - سمت چپ: نوار آبی پرچم ایران و عبارت I.R. IRAN
+
+    نکته فنی Flet 1.0: چون `rtl=False` مقدار پیش‌فرض Control است، روی صفحه‌ای با
+    `page.rtl = True` مقدار `rtl=False` جهت چیدمان را به LTR برنمی‌گرداند؛ بنابراین
+    چیدمان عناصر صراحتاً با `rtl=True` و به ترتیب راست‌به‌چپ تنظیم شده است تا
+    روی همه گوشی‌ها همیشه نوار آبی دقیقاً در سمت چپ و «ایران» در سمت راست قرار گیرد.
+    """
     border_color = status_to_box_color(status)
     left2, letter, mid3, iran2 = format_iranian_plate(chars_persian)
 
     if len(chars_persian) == 8:
         plate_body = ft.Row(
             spacing=0,
+            rtl=True,
             vertical_alignment=ft.CrossAxisAlignment.CENTER,
             controls=[
-                # بخش آبی رنگ سمت چپ پلاک ایران
+                # ۱. سمت راست پلاک: کادر «ایران» و کد دو رقمی شهر
+                ft.Container(
+                    width=58,
+                    height=54,
+                    bgcolor=ft.Colors.WHITE,
+                    alignment=ft.Alignment.CENTER,
+                    content=ft.Column(
+                        spacing=0,
+                        alignment=ft.MainAxisAlignment.CENTER,
+                        horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                        controls=[
+                            ft.Text("ایران", size=10, color=ft.Colors.BLACK, weight=ft.FontWeight.W_600),
+                            ft.Text(iran2, size=20, color=ft.Colors.BLACK, weight=ft.FontWeight.BOLD),
+                        ],
+                    ),
+                ),
+                # ۲. خط جداکننده عمودی
+                ft.Container(width=2, height=54, bgcolor=ft.Colors.BLACK),
+                # ۳. بخش اصلی شماره پلاک (در RTL از راست به چپ: ۳ رقم ← حرف ← ۲ رقم)
+                ft.Container(
+                    expand=True,
+                    height=54,
+                    bgcolor=ft.Colors.WHITE,
+                    alignment=ft.Alignment.CENTER,
+                    padding=ft.Padding.symmetric(horizontal=8),
+                    content=ft.Row(
+                        alignment=ft.MainAxisAlignment.SPACE_EVENLY,
+                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                        rtl=True,
+                        controls=[
+                            ft.Text(mid3, size=24, weight=ft.FontWeight.BOLD, color=ft.Colors.BLACK),
+                            ft.Text(letter, size=24, weight=ft.FontWeight.BOLD, color=ft.Colors.BLACK),
+                            ft.Text(left2, size=24, weight=ft.FontWeight.BOLD, color=ft.Colors.BLACK),
+                        ],
+                    ),
+                ),
+                # ۴. سمت چپ پلاک: نوار آبی پرچم ایران و I.R. IRAN
                 ft.Container(
                     width=34,
                     height=54,
@@ -161,44 +210,7 @@ def build_iranian_plate_widget(
                         ],
                     ),
                 ),
-                # بخش اصلی شماره پلاک (چپ به راست)
-                ft.Container(
-                    expand=True,
-                    height=54,
-                    bgcolor=ft.Colors.WHITE,
-                    alignment=ft.Alignment.CENTER,
-                    padding=ft.Padding.symmetric(horizontal=8),
-                    content=ft.Row(
-                        alignment=ft.MainAxisAlignment.SPACE_EVENLY,
-                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                        rtl=False,
-                        controls=[
-                            ft.Text(left2, size=24, weight=ft.FontWeight.BOLD, color=ft.Colors.BLACK),
-                            ft.Text(letter, size=24, weight=ft.FontWeight.BOLD, color=ft.Colors.BLACK),
-                            ft.Text(mid3, size=24, weight=ft.FontWeight.BOLD, color=ft.Colors.BLACK),
-                        ],
-                    ),
-                ),
-                # خط جداکننده
-                ft.Container(width=2, height=54, bgcolor=ft.Colors.BLACK),
-                # کد شهر (ایران)
-                ft.Container(
-                    width=56,
-                    height=54,
-                    bgcolor=ft.Colors.WHITE,
-                    alignment=ft.Alignment.CENTER,
-                    content=ft.Column(
-                        spacing=0,
-                        alignment=ft.MainAxisAlignment.CENTER,
-                        horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-                        controls=[
-                            ft.Text("ایران", size=10, color=ft.Colors.BLACK, weight=ft.FontWeight.W_600),
-                            ft.Text(iran2, size=20, color=ft.Colors.BLACK, weight=ft.FontWeight.BOLD),
-                        ],
-                    ),
-                ),
             ],
-            rtl=False,
         )
     else:
         placeholder = left2 if left2 else "در انتظار تشخیص پلاک..."

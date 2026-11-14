@@ -18,6 +18,8 @@ SRC_DIR = Path(__file__).resolve().parents[1] / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
+import pytest
+
 from config import AppSettings, CLASS_ID_PLATE, format_iranian_plate
 from core.geometry import (
     compute_android_rotation_degrees,
@@ -33,7 +35,10 @@ from core.plate_detector import (
 from services.api_client import (
     PlateApiClient,
     PlateCheckStatus,
+    delete_violation_record,
+    load_violation_records,
     parse_server_plate_response,
+    read_violation_image_bytes,
 )
 
 
@@ -279,4 +284,106 @@ def test_submit_violation_sends_to_api_and_logs_locally(tmp_path, monkeypatch) -
             await client.close()
 
     asyncio.run(run())
+
+
+def test_submit_violation_with_evidence_photo_history_retry_and_delete(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("FLET_APP_STORAGE_DATA", str(tmp_path))
+    captured_payloads: list[dict] = []
+    server_status = 503
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        import json
+
+        assert str(request.url) == "http://myweb.web.com/api/violation"
+        captured_payloads.append(json.loads(request.content.decode("utf-8")))
+        if server_status == 200:
+            return httpx.Response(200, json={"ok": True, "id": "srv-1"})
+        return httpx.Response(server_status, text="Service Unavailable")
+
+    async def run() -> None:
+        nonlocal server_status
+        plate_jpg = b"\xff\xd8\xff\xe0PLATE_BYTES\xff\xd9"
+        evidence_jpg = b"\xff\xd8\xff\xe0EVIDENCE_DOC_BYTES\xff\xd9"
+
+        client = PlateApiClient(AppSettings())
+        client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            # 1. ثبت تخلف با هر دو عکس (پلاک + مستندات) در حالت خطای سرور -> ذخیره محلی
+            res = await client.submit_violation(
+                plate_persian="۱۲ ب ۳۴۵ | ایران ۱۱",
+                plate_latin="12B34511",
+                violation_type="ورود غیرمجاز به محدوده",
+                description="تردد در طرح ترافیک بدون مجوز",
+                plate_crop_jpeg=plate_jpg,
+                evidence_image_jpeg=evidence_jpg,
+            )
+            assert res.success is False
+            assert res.saved_locally is True
+            assert res.record_id
+            assert captured_payloads[0]["has_image"] is True
+            assert captured_payloads[0]["has_evidence_image"] is True
+            assert "image_base64" in captured_payloads[0]
+            assert "evidence_image_base64" in captured_payloads[0]
+
+            # 2. بازبینی فهرست تخلفات و بررسی تصاویر ذخیره‌شده محلی
+            records = load_violation_records()
+            assert len(records) == 1
+            rec = records[0]
+            assert rec.id == res.record_id
+            assert rec.synced is False
+            assert rec.has_image is True
+            assert rec.has_evidence_image is True
+            assert read_violation_image_bytes(rec.plate_image_file) == plate_jpg
+            assert read_violation_image_bytes(rec.evidence_image_file) == evidence_jpg
+
+            # 3. ارسال مجدد پس از وصل شدن سرور -> تغییر وضعیت به synced=True
+            server_status = 200
+            retry_res = await client.retry_violation_sync(rec)
+            assert retry_res.success is True
+            refreshed = load_violation_records()
+            assert len(refreshed) == 1
+            assert refreshed[0].synced is True
+            assert "evidence_image_base64" in captured_payloads[1]
+
+            # 4. حذف رکورد و پاک‌سازی فایل‌های تصویر
+            assert delete_violation_record(rec.id) is True
+            assert load_violation_records() == []
+            assert read_violation_image_bytes(rec.plate_image_file) is None
+            assert read_violation_image_bytes(rec.evidence_image_file) is None
+        finally:
+            await client.close()
+
+    asyncio.run(run())
+
+
+def test_iranian_plate_widget_rtl_order_when_flet_available() -> None:
+    ft = pytest.importorskip("flet")
+    from ui.components import build_iranian_plate_widget
+
+    widget = build_iranian_plate_widget(
+        ["1", "2", "ب", "3", "4", "5", "1", "1"],
+        PlateCheckStatus.APPROVED,
+    )
+    outer_row = widget.content
+    assert isinstance(outer_row, ft.Row)
+    assert outer_row.rtl is True
+    assert len(outer_row.controls) == 4
+
+    # 1. راست‌ترین بخش (controls[0]): کادر «ایران ۱۱»
+    iran_col = outer_row.controls[0].content
+    assert iran_col.controls[0].value == "ایران"
+    assert iran_col.controls[1].value == "۱۱"
+
+    # 2. بخش وسط (controls[2]): در RTL از راست به چپ -> ۳ رقم، حرف، ۲ رقم
+    mid_row = outer_row.controls[2].content
+    assert isinstance(mid_row, ft.Row)
+    assert mid_row.rtl is True
+    assert [c.value for c in mid_row.controls] == ["۳۴۵", "ب", "۱۲"]
+
+    # 3. چپ‌ترین بخش (controls[3]): نوار آبی I.R. IRAN
+    blue_strip = outer_row.controls[3]
+    assert blue_strip.bgcolor == ft.Colors.BLUE_900
+
 
