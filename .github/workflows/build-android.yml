@@ -114,9 +114,9 @@ jobs:
             --download-from-github \
             --output-dir src/weights
 
-      - name: 11. همگام‌سازی و بررسی پوشه weights
+      - name: 11. همگام‌سازی پوشه weights و آیکون برنامه (2.png -> src/assets/icon.png)
         run: |
-          mkdir -p src/weights
+          mkdir -p src/weights src/assets
           if [ -d "weights" ] && ls weights/*.onnx >/dev/null 2>&1; then
             cp -n weights/*.onnx src/weights/ || true
           fi
@@ -125,6 +125,36 @@ jobs:
           if ! ls src/weights/*.onnx >/dev/null 2>&1; then
             echo "::warning::هیچ فایل .onnx در src/weights یافت نشد! APK ساخته می‌شود اما برای تشخیص پلاک باید فایل‌های ONNX را در src/weights قرار دهید."
           fi
+
+          # تنظیم خودکار آیکون برنامه در صورت وجود فایل 2.png یا icon.png
+          ICON_SRC=""
+          for candidate in "2.png" "src/assets/2.png" "assets/2.png" "assets/icon.png"; do
+            if [ -f "$candidate" ]; then
+              ICON_SRC="$candidate"
+              break
+            fi
+          done
+          if [ -n "$ICON_SRC" ]; then
+            echo "تنظیم آیکون اپلیکیشن از مسیر: $ICON_SRC"
+            uv run python -c "
+          from PIL import Image
+          with Image.open('${ICON_SRC}') as im:
+              rgba = im.convert('RGBA')
+              w, h = rgba.size
+              if w != h:
+                  side = max(w, h)
+                  canvas = Image.new('RGBA', (side, side), (0, 0, 0, 0))
+                  canvas.paste(rgba, ((side - w) // 2, (side - h) // 2), rgba)
+                  rgba = canvas
+              rgba.save('src/assets/icon.png', format='PNG')
+              rgba.save('src/assets/icon_android.png', format='PNG')
+          print('آیکون استاندارد PNG آماده شد:', rgba.size)
+          "
+          elif [ -f "src/assets/icon.png" ] && [ ! -f "src/assets/icon_android.png" ]; then
+            cp -f "src/assets/icon.png" "src/assets/icon_android.png"
+          fi
+          echo "=== فایل‌های پوشه src/assets ==="
+          ls -lh src/assets/
 
       - name: 12. پذیرش خودکار لایسنس‌های Android SDK
         run: |
