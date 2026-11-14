@@ -1,0 +1,42 @@
+name: Export YOLO26 ONNX Models (Optional Helper)
+
+on:
+  workflow_dispatch:
+    inputs:
+      imgsz:
+        description: "اندازه ورودی مدل ONNX (پیش‌فرض 640، برای گوشی‌های ضعیف‌تر 480 یا 320)"
+        type: choice
+        default: "640"
+        options:
+          - "640"
+          - "480"
+          - "320"
+
+jobs:
+  export-onnx:
+    name: Export cars_best_v26.onnx & chars_best_v26.onnx
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: دریافت کد مخزن
+        uses: actions/checkout@v4
+
+      - name: نصب uv و پایتون 3.13
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.13"
+          enable-cache: true
+
+      - name: دانلود وزن‌های YOLO26 از مخزن مرجع و تبدیل به ONNX
+        run: |
+          uv run --with ultralytics --with onnx --with onnxslim python scripts/export_onnx.py \
+            --download-from-github \
+            --imgsz "${{ inputs.imgsz }}" \
+            --output-dir exported_weights
+
+      - name: آپلود فایل‌های ONNX آماده برای قرار دادن در پوشه src/weights
+        uses: actions/upload-artifact@v4
+        with:
+          name: persian-plate-onnx-weights-${{ inputs.imgsz }}
+          path: exported_weights/*.onnx
+          retention-days: 14
