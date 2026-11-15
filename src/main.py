@@ -1138,35 +1138,39 @@ async def main(page: ft.Page) -> None:
     review_violations_btn.on_click = switch_to_history_view
 
     # -----------------------------------------------------------------------
-    # دیالوگ تنظیمات (آدرس سرور + دکمه رادیویی حالت استعلام خودکار، پیش‌فرض غیرفعال)
+    # دیالوگ تنظیمات (آدرس سرور + کلید ft.Switch برای حالت استعلام خودکار، پیش‌فرض غیرفعال)
     # -----------------------------------------------------------------------
     def open_settings_dialog(_e=None) -> None:
         base_url_tf = ft.TextField(label="آدرس پایه سرور API", value=settings.api_base_url)
         check_path_tf = ft.TextField(label="مسیر استعلام پلاک", value=settings.api_check_path)
         viol_path_tf = ft.TextField(label="مسیر ثبت تخلف", value=settings.api_violation_path)
 
-        auto_query_radio = ft.RadioGroup(
-            value="auto" if settings.auto_query_enabled else "manual",
-            content=ft.Column(
-                spacing=4,
-                controls=[
-                    ft.Radio(
-                        value="manual",
-                        label="غیرفعال — استعلام دستی با دکمه «استعلام پلاک» (پیش‌فرض)",
-                    ),
-                    ft.Radio(
-                        value="auto",
-                        label="فعال — استعلام خودکار بلافاصله پس از تشخیص پلاک",
-                    ),
-                ],
-            ),
+        def _auto_query_hint(enabled: bool) -> str:
+            if enabled:
+                return "فعال: بلافاصله پس از تشخیص پلاک، استعلام به‌صورت خودکار از سرور انجام می‌شود."
+            return "غیرفعال (پیش‌فرض): استعلام فقط هنگام فشردن دکمه «استعلام پلاک» انجام می‌شود."
+
+        auto_query_hint_text = ft.Text(
+            _auto_query_hint(settings.auto_query_enabled),
+            size=11,
+            color=ft.Colors.WHITE_70,
+        )
+
+        def _on_auto_query_toggle(ev: ft.ControlEvent) -> None:
+            auto_query_hint_text.value = _auto_query_hint(bool(ev.control.value))
+            auto_query_hint_text.update()
+
+        auto_query_switch = ft.Switch(
+            label="استعلام خودکار",
+            value=settings.auto_query_enabled,
+            on_change=_on_auto_query_toggle,
         )
 
         def _save_settings_click(_ev) -> None:
             settings.api_base_url = (base_url_tf.value or "http://myweb.web.com").strip()
             settings.api_check_path = (check_path_tf.value or "/api/plate/check").strip()
             settings.api_violation_path = (viol_path_tf.value or "/api/violation").strip()
-            settings.auto_query_enabled = auto_query_radio.value == "auto"
+            settings.auto_query_enabled = bool(auto_query_switch.value)
             save_settings(settings)
             api_client.clear_cache()
             page.pop_dialog()
@@ -1185,18 +1189,18 @@ async def main(page: ft.Page) -> None:
                         spacing=10,
                         scroll=ft.ScrollMode.AUTO,
                         controls=[
-                            ft.Text(
-                                "حالت استعلام پلاک از سرور:",
-                                size=13,
-                                weight=ft.FontWeight.BOLD,
-                                color=ft.Colors.LIGHT_BLUE_200,
-                            ),
                             ft.Container(
-                                padding=ft.Padding.all(8),
+                                padding=ft.Padding.all(10),
                                 border_radius=ft.BorderRadius.all(10),
                                 bgcolor="#161B22",
                                 border=ft.Border.all(1, ft.Colors.BLUE_GREY_800),
-                                content=auto_query_radio,
+                                content=ft.Column(
+                                    spacing=6,
+                                    controls=[
+                                        auto_query_switch,
+                                        auto_query_hint_text,
+                                    ],
+                                ),
                             ),
                             ft.Divider(height=6, color=ft.Colors.BLUE_GREY_800),
                             base_url_tf,

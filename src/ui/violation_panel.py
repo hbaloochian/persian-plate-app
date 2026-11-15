@@ -66,9 +66,10 @@ class ViolationRegistrationPanel(ft.Container):
         self.notes_field = ft.TextField(
             label="توضیحات تکمیلی (اختیاری)",
             hint_text="محل دقیق تخلف یا یادداشت مأمور...",
+            expand=True,
             multiline=True,
-            min_lines=3,
-            max_lines=5,
+            min_lines=6,
+            max_lines=10,
         )
 
         # بخش پیوست تصویر برش‌خورده پلاک
@@ -277,7 +278,7 @@ class ViolationRegistrationPanel(ft.Container):
                     ],
                 ),
                 ft.Row(controls=[self.violation_dropdown]),
-                self.notes_field,
+                ft.Row(controls=[self.notes_field]),
                 ft.Container(
                     padding=ft.Padding.symmetric(horizontal=10, vertical=8),
                     border_radius=ft.BorderRadius.all(10),
