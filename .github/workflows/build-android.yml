@@ -153,8 +153,26 @@ jobs:
           elif [ -f "src/assets/icon.png" ] && [ ! -f "src/assets/icon_android.png" ]; then
             cp -f "src/assets/icon.png" "src/assets/icon_android.png"
           fi
-          echo "=== فایل‌های پوشه src/assets ==="
-          ls -lh src/assets/
+
+          # دانلود خودکار فونت فارسی Vazirmatn (لایسنس SIL OFL 1.1) جهت تولید گزارش‌های PDF فارسی با کیفیت بالا
+          mkdir -p src/assets/fonts
+          if [ ! -f "src/assets/fonts/Vazirmatn-Regular.ttf" ]; then
+            curl -fsSL --retry 3 \
+              "https://raw.githubusercontent.com/rastikerdar/vazirmatn/master/fonts/ttf/Vazirmatn-Regular.ttf" \
+              -o "src/assets/fonts/Vazirmatn-Regular.ttf" || rm -f "src/assets/fonts/Vazirmatn-Regular.ttf"
+          fi
+          if [ ! -f "src/assets/fonts/Vazirmatn-Bold.ttf" ]; then
+            curl -fsSL --retry 3 \
+              "https://raw.githubusercontent.com/rastikerdar/vazirmatn/master/fonts/ttf/Vazirmatn-Bold.ttf" \
+              -o "src/assets/fonts/Vazirmatn-Bold.ttf" || rm -f "src/assets/fonts/Vazirmatn-Bold.ttf"
+          fi
+          # پشتیبان امن در صورت نبود دسترسی موقت به فونت Vazirmatn
+          if [ ! -f "src/assets/fonts/Vazirmatn-Regular.ttf" ] && [ -f "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf" ]; then
+            cp -f "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf" "src/assets/fonts/DejaVuSans.ttf"
+            cp -f "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" "src/assets/fonts/DejaVuSans-Bold.ttf" || true
+          fi
+          echo "=== فایل‌های پوشه src/assets و فونت‌های فارسی ==="
+          ls -lh src/assets/ src/assets/fonts/
 
       - name: 12. پذیرش خودکار لایسنس‌های Android SDK
         run: |
