@@ -16,7 +16,14 @@ from typing import Any
 
 import httpx
 
-from config import AppSettings, get_writable_data_dir
+from config import AppSettings, get_writable_data_dir, to_persian_digits
+from core.jalali import (
+    format_jalali_date,
+    format_jalali_time,
+    format_jalali_verbose_date,
+    iso_to_jalali_parts,
+    now_iran_datetime,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -61,7 +68,7 @@ class ViolationSubmissionResult:
 
 @dataclass(slots=True)
 class ViolationRecord:
-    """ساختار هر رکورد تخلف ثبت‌شده برای نمایش در صفحه بازبینی تخلفات و ارسال مجدد."""
+    """ساختار هر رکورد تخلف ثبت‌شده برای نمایش در صفحه بازبینی تخلفات، گزارش PDF و ارسال مجدد."""
 
     id: str
     plate: str
@@ -70,6 +77,9 @@ class ViolationRecord:
     description: str
     timestamp: str
     local_time: str = ""
+    jalali_date: str = ""
+    jalali_time: str = ""
+    jalali_weekday: str = ""
     has_image: bool = False
     has_evidence_image: bool = False
     plate_image_file: str | None = None
@@ -77,12 +87,36 @@ class ViolationRecord:
     synced: bool = False
     server_response: str = ""
 
+    @property
+    def display_jalali_datetime(self) -> str:
+        """تاریخ شمسی و ساعت را با ارقام فارسی برمی‌گرداند (مثال: ۱۴۰۵/۰۸/۲۳ - ۱۵:۴۲:۱۸)."""
+        if self.jalali_date and self.jalali_time:
+            return to_persian_digits(f"{self.jalali_date} - {self.jalali_time}")
+        if self.jalali_date:
+            return to_persian_digits(self.jalali_date)
+        return to_persian_digits(self.local_time or self.timestamp)
+
     @classmethod
     def from_dict(cls, data: dict[str, Any], fallback_index: int = 0) -> "ViolationRecord":
         raw_ts = str(data.get("timestamp") or "")
         local_time = str(data.get("local_time") or "")
-        if not local_time and raw_ts:
-            local_time = raw_ts.replace("T", " ")[:19]
+        jalali_date = str(data.get("jalali_date") or "")
+        jalali_time = str(data.get("jalali_time") or "")
+        jalali_weekday = str(data.get("jalali_weekday") or "")
+
+        # سازگاری با رکوردهای قدیمی که فقط timestamp میلادی داشتند
+        if (not jalali_date or not jalali_time) and raw_ts:
+            conv_date, conv_time, conv_verbose = iso_to_jalali_parts(raw_ts)
+            jalali_date = jalali_date or conv_date
+            jalali_time = jalali_time or conv_time
+            jalali_weekday = jalali_weekday or conv_verbose
+
+        if not local_time:
+            if jalali_date and jalali_time:
+                local_time = f"{jalali_date} - {jalali_time}"
+            elif raw_ts:
+                local_time = raw_ts.replace("T", " ")[:19]
+
         return cls(
             id=str(data.get("id") or f"legacy-{fallback_index}"),
             plate=str(data.get("plate") or "---"),
@@ -91,6 +125,9 @@ class ViolationRecord:
             description=str(data.get("description") or ""),
             timestamp=raw_ts,
             local_time=local_time,
+            jalali_date=jalali_date,
+            jalali_time=jalali_time,
+            jalali_weekday=jalali_weekday,
             has_image=bool(data.get("has_image", False)),
             has_evidence_image=bool(data.get("has_evidence_image", False)),
             plate_image_file=(
@@ -430,10 +467,16 @@ class PlateApiClient:
         plate_crop_jpeg: bytes | None = None,
         evidence_image_jpeg: bytes | None = None,
     ) -> ViolationSubmissionResult:
-        """گزارش تخلف (همراه با تصویر برش پلاک و تصویر مستندات) را به سرور ارسال و در حافظه محلی ذخیره می‌کند."""
-        record_id = f"v-{datetime.now().strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:6]}"
-        iso_ts = datetime.now(timezone.utc).isoformat()
-        local_time = datetime.now().strftime("%Y/%m/%d - %H:%M:%S")
+        """گزارش تخلف (همراه با تاریخ شمسی، ساعت، تصویر برش پلاک و تصویر مستندات) را به سرور ارسال و محلی ذخیره می‌کند."""
+        now_ir = now_iran_datetime()
+        jalali_date = format_jalali_date(now_ir, persian_digits=False)
+        jalali_time = format_jalali_time(now_ir, persian_digits=False)
+        jalali_weekday = format_jalali_verbose_date(now_ir, persian_digits=True)
+        jalali_datetime = f"{jalali_date} {jalali_time}"
+
+        record_id = f"v-{now_ir.strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:6]}"
+        iso_ts = now_ir.astimezone(timezone.utc).isoformat()
+        local_time = f"{jalali_date} - {jalali_time}"
 
         plate_img_file = save_violation_image_bytes(f"{record_id}_plate.jpg", plate_crop_jpeg)
         evidence_img_file = save_violation_image_bytes(
@@ -448,6 +491,10 @@ class PlateApiClient:
             "violation_type": violation_type,
             "description": description.strip(),
             "timestamp": iso_ts,
+            "jalali_date": jalali_date,
+            "jalali_time": jalali_time,
+            "jalali_datetime": jalali_datetime,
+            "jalali_weekday": jalali_weekday,
             "has_image": plate_crop_jpeg is not None,
             "has_evidence_image": evidence_image_jpeg is not None,
         }
@@ -481,6 +528,9 @@ class PlateApiClient:
             description=description.strip(),
             timestamp=iso_ts,
             local_time=local_time,
+            jalali_date=jalali_date,
+            jalali_time=jalali_time,
+            jalali_weekday=jalali_weekday,
             has_image=plate_crop_jpeg is not None,
             has_evidence_image=evidence_image_jpeg is not None,
             plate_image_file=plate_img_file,
@@ -510,6 +560,10 @@ class PlateApiClient:
             "violation_type": record.violation_type,
             "description": record.description,
             "timestamp": record.timestamp,
+            "jalali_date": record.jalali_date,
+            "jalali_time": record.jalali_time,
+            "jalali_datetime": f"{record.jalali_date} {record.jalali_time}".strip(),
+            "jalali_weekday": record.jalali_weekday,
             "has_image": plate_bytes is not None,
             "has_evidence_image": evidence_bytes is not None,
         }

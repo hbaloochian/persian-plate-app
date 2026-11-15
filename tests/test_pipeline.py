@@ -387,3 +387,145 @@ def test_iranian_plate_widget_rtl_order_when_flet_available() -> None:
     assert blue_strip.bgcolor == ft.Colors.BLUE_900
 
 
+def test_jalali_calendar_conversion_and_iso_fallback() -> None:
+    from datetime import datetime
+    from core.jalali import (
+        IRAN_TIMEZONE,
+        format_jalali_date,
+        format_jalali_time,
+        format_jalali_verbose_date,
+        gregorian_to_jalali,
+        iso_to_jalali_parts,
+    )
+
+    # نوروز ۱۴۰۳ (سال کبیسه شمسی) و روز ۳۰ اسفند ۱۴۰۳ و نوروز ۱۴۰۴ و ۱۴۰۵
+    assert gregorian_to_jalali(2024, 3, 20) == (1403, 1, 1)
+    assert gregorian_to_jalali(2025, 3, 20) == (1403, 12, 30)
+    assert gregorian_to_jalali(2025, 3, 21) == (1404, 1, 1)
+    assert gregorian_to_jalali(2026, 3, 21) == (1405, 1, 1)
+    assert gregorian_to_jalali(2026, 11, 14) == (1405, 8, 23)
+
+    dt = datetime(2026, 11, 14, 15, 42, 18, tzinfo=IRAN_TIMEZONE)
+    assert format_jalali_date(dt) == "1405/08/23"
+    assert format_jalali_date(dt, persian_digits=True) == "۱۴۰۵/۰۸/۲۳"
+    assert format_jalali_time(dt) == "15:42:18"
+    assert format_jalali_verbose_date(dt) == "شنبه ۲۳ آبان ۱۴۰۵"
+
+    # تبدیل رکوردهای قدیمی با زمان UTC به وقت ایران (UTC+03:30)
+    j_date, j_time, j_verbose = iso_to_jalali_parts("2026-11-14T12:12:18+00:00")
+    assert j_date == "1405/08/23"
+    assert j_time == "15:42:18"
+    assert j_verbose == "شنبه ۲۳ آبان ۱۴۰۵"
+
+
+def test_settings_auto_query_default_disabled_and_persisted(tmp_path) -> None:
+    from config import load_settings, save_settings
+
+    # پیش‌فرض باید غیرفعال باشد
+    initial = load_settings(data_dir=tmp_path)
+    assert initial.auto_query_enabled is False
+
+    # ذخیره فعال‌سازی توسط کاربر و خواندن مجدد
+    initial.auto_query_enabled = True
+    initial.api_base_url = "https://myweb.web.com"
+    save_settings(initial, data_dir=tmp_path)
+
+    reloaded = load_settings(data_dir=tmp_path)
+    assert reloaded.auto_query_enabled is True
+    assert reloaded.api_base_url == "https://myweb.web.com"
+
+
+def test_iranian_plate_parse_and_compose_roundtrip() -> None:
+    from config import compose_iranian_plate, parse_iranian_plate_text
+
+    l2, letter, m3, i2 = parse_iranian_plate_text("۱۲ ب ۳۴۵ | ایران ۱۱")
+    assert (l2, letter, m3, i2) == ("۱۲", "ب", "۳۴۵", "۱۱")
+
+    display_fa, latin, chars_8 = compose_iranian_plate("12", "ب", "345", "11")
+    assert display_fa == "۱۲ ب ۳۴۵ | ایران ۱۱"
+    assert latin == "12B34511"
+    assert chars_8 == ["1", "2", "ب", "3", "4", "5", "1", "1"]
+
+
+def test_persian_text_shaper_and_bidi_visual_order() -> None:
+    from core.persian_text import reshape_persian, to_visual_rtl
+
+    # لیگچر «لا» در کلمه «پلاک»
+    reshaped = reshape_persian("پلاک")
+    assert "\ufefc" in reshaped or "\ufefb" in reshaped
+
+    # حفظ جهت چپ‌به‌راست تاریخ و کد لاتین درون متن فارسی
+    visual = to_visual_rtl("تاریخ: ۱۴۰۵/۰۸/۲۳ - کد 12B34511")
+    assert "۱۴۰۵/۰۸/۲۳" in visual
+    assert "12B34511" in visual
+
+
+def test_violation_stores_jalali_datetime_and_exports_valid_pdf(tmp_path, monkeypatch) -> None:
+    import io
+    from PIL import Image
+    from services.pdf_report import (
+        build_violation_pdf_filename,
+        generate_violation_pdf_bytes,
+        save_pdf_backup_in_app_storage,
+    )
+
+    monkeypatch.setenv("FLET_APP_STORAGE_DATA", str(tmp_path))
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        import json
+
+        captured.update(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(200, json={"ok": True})
+
+    # ساخت دو تصویر JPEG معتبر برای پلاک و مستندات
+    plate_buf = io.BytesIO()
+    Image.new("RGB", (240, 60), (240, 240, 240)).save(plate_buf, format="JPEG")
+    evidence_buf = io.BytesIO()
+    Image.new("RGB", (320, 240), (40, 80, 120)).save(evidence_buf, format="JPEG")
+
+    async def run() -> None:
+        client = PlateApiClient(AppSettings())
+        client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            res = await client.submit_violation(
+                plate_persian="۱۲ ب ۳۴۵ | ایران ۱۱",
+                plate_latin="12B34511",
+                violation_type="توقف ممنوع / پارک دوبل",
+                description="پارک در محل ممنوعه",
+                plate_crop_jpeg=plate_buf.getvalue(),
+                evidence_image_jpeg=evidence_buf.getvalue(),
+            )
+            assert res.success is True
+            assert captured["jalali_date"].count("/") == 2
+            assert captured["jalali_time"].count(":") == 2
+
+            records = load_violation_records()
+            assert len(records) == 1
+            rec = records[0]
+            assert rec.jalali_date == captured["jalali_date"]
+            assert rec.jalali_time == captured["jalali_time"]
+            assert rec.jalali_weekday
+
+            # نام فایل PDF باید دقیقاً بر اساس اطلاعات پلاک باشد و بدون کاراکتر غیرمجاز
+            filename = build_violation_pdf_filename(rec)
+            assert filename == "۱۲-ب-۳۴۵-ایران-۱۱.pdf"
+
+            pdf_bytes = generate_violation_pdf_bytes(
+                rec,
+                plate_image_bytes=read_violation_image_bytes(rec.plate_image_file),
+                evidence_image_bytes=read_violation_image_bytes(rec.evidence_image_file),
+            )
+            assert pdf_bytes.startswith(b"%PDF-")
+            assert len(pdf_bytes) > 10_000
+
+            backup_file = save_pdf_backup_in_app_storage(pdf_bytes, filename)
+            assert backup_file.is_file()
+            assert backup_file.name == filename
+        finally:
+            await client.close()
+
+    asyncio.run(run())
+
+
+

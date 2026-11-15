@@ -1,10 +1,11 @@
-"""بخش پایینی صفحه برای ثبت تخلف خودرو (با فشردن دکمه «ثبت تخلف» جایگزین بخش اطلاعات سرور می‌شود).
+"""صفحه تمام‌صفحه ثبت تخلف خودرو با ورودی گرافیکی پلاک استاندارد ایران.
 
 امکانات:
-- شماره پلاک (پُر شده به‌صورت خودکار از آخرین تشخیص + قابل ویرایش)
+- نمایش تمام‌صفحه با نوار عنوان و نمایش تاریخ شمسی و ساعت فعلی
+- ورودی پلاک خودرو دقیقاً به شکل گرافیکی پلاک ایران (مانند صفحه اول) با قابلیت پر شدن خودکار و ویرایش
 - انتخاب نوع تخلف و توضیحات تکمیلی
 - پیوست تصویر برش‌خورده پلاک (با پیش‌نمایش)
-- افزودن عکس مستندات تخلف (از طریق عکس‌برداری مستقیم با دوربین یا انتخاب از گالری گوشی)
+- افزودن عکس مستندات تخلف (از طریق دوربین زنده یا انتخاب از گالری گوشی)
 """
 
 from __future__ import annotations
@@ -14,19 +15,26 @@ from typing import Awaitable, Callable
 import flet as ft
 
 from config import VIOLATION_TYPES, to_persian_digits
+from core.jalali import format_jalali_date, format_jalali_time, now_iran_datetime
+from ui.components import EditableIranianPlateInput
 
 
 class ViolationRegistrationPanel(ft.Container):
-    """فرم ثبت تخلف در نیمه پایینی صفحه اصلی."""
+    """صفحه تمام‌صفحه ثبت تخلف."""
 
     def __init__(
         self,
+        page: ft.Page,
         on_back: Callable[[], None],
-        on_submit: Callable[[str, str, str, bool, bytes | None], Awaitable[None]],
+        on_submit: Callable[[str, str, str, str, bool, bytes | None], Awaitable[None]],
         on_capture_evidence: Callable[[], Awaitable[bytes | None]],
         on_pick_evidence: Callable[[], Awaitable[bytes | None]],
     ) -> None:
-        super().__init__(expand=True, padding=ft.Padding.all(12))
+        super().__init__(
+            expand=True,
+            bgcolor="#0D1117",
+            padding=ft.Padding.all(14),
+        )
         self._on_back = on_back
         self._on_submit = on_submit
         self._on_capture_evidence = on_capture_evidence
@@ -35,13 +43,15 @@ class ViolationRegistrationPanel(ft.Container):
         self._capturing_evidence = False
         self._evidence_bytes: bytes | None = None
 
-        self.plate_field = ft.TextField(
-            label="شماره پلاک خودرو",
-            hint_text="مثال: ۱۲ ب ۳۴۵ | ایران ۶۷",
-            text_size=15,
-            dense=True,
-            prefix_icon=ft.Icons.DIRECTIONS_CAR,
+        self.datetime_badge = ft.Text(
+            "",
+            size=12,
+            color=ft.Colors.LIGHT_BLUE_200,
+            weight=ft.FontWeight.W_600,
         )
+
+        # ورودی گرافیکی پلاک ایران (دقیقاً به شکل پلاک صفحه اول)
+        self.plate_input = EditableIranianPlateInput(page=page, border_color=ft.Colors.BLUE_500)
 
         self.violation_dropdown = ft.Dropdown(
             label="نوع تخلف",
@@ -55,11 +65,10 @@ class ViolationRegistrationPanel(ft.Container):
 
         self.notes_field = ft.TextField(
             label="توضیحات تکمیلی (اختیاری)",
-            hint_text="محل تخلف یا یادداشت مأمور...",
+            hint_text="محل دقیق تخلف یا یادداشت مأمور...",
             multiline=True,
-            min_lines=2,
-            max_lines=3,
-            dense=True,
+            min_lines=3,
+            max_lines=5,
         )
 
         # بخش پیوست تصویر برش‌خورده پلاک
@@ -72,7 +81,7 @@ class ViolationRegistrationPanel(ft.Container):
         # بخش افزودن عکس مستندات تخلف (دوربین زنده یا گالری)
         self.evidence_status_text = ft.Text(
             "عکسی انتخاب نشده (اختیاری)",
-            size=11,
+            size=12,
             color=ft.Colors.WHITE_60,
         )
         self.evidence_preview_holder = ft.Container(visible=False)
@@ -83,13 +92,13 @@ class ViolationRegistrationPanel(ft.Container):
                 spacing=6,
                 alignment=ft.MainAxisAlignment.CENTER,
                 controls=[
-                    ft.Icon(ft.Icons.CAMERA_ALT, size=16),
-                    ft.Text("عکس با دوربین", size=12),
+                    ft.Icon(ft.Icons.CAMERA_ALT, size=18),
+                    ft.Text("عکس با دوربین", size=13),
                 ],
             ),
             style=ft.ButtonStyle(
-                shape=ft.RoundedRectangleBorder(radius=8),
-                padding=ft.Padding.symmetric(horizontal=10, vertical=8),
+                shape=ft.RoundedRectangleBorder(radius=10),
+                padding=ft.Padding.symmetric(horizontal=10, vertical=10),
             ),
             expand=True,
             on_click=self._handle_capture_evidence,
@@ -101,13 +110,13 @@ class ViolationRegistrationPanel(ft.Container):
                 spacing=6,
                 alignment=ft.MainAxisAlignment.CENTER,
                 controls=[
-                    ft.Icon(ft.Icons.PHOTO_LIBRARY, size=16),
-                    ft.Text("انتخاب از گالری", size=12),
+                    ft.Icon(ft.Icons.PHOTO_LIBRARY, size=18),
+                    ft.Text("انتخاب از گالری", size=13),
                 ],
             ),
             style=ft.ButtonStyle(
-                shape=ft.RoundedRectangleBorder(radius=8),
-                padding=ft.Padding.symmetric(horizontal=10, vertical=8),
+                shape=ft.RoundedRectangleBorder(radius=10),
+                padding=ft.Padding.symmetric(horizontal=10, vertical=10),
             ),
             expand=True,
             on_click=self._handle_pick_evidence,
@@ -116,19 +125,19 @@ class ViolationRegistrationPanel(ft.Container):
         self.remove_evidence_btn = ft.IconButton(
             icon=ft.Icons.DELETE_OUTLINE,
             icon_color=ft.Colors.RED_400,
-            icon_size=20,
+            icon_size=22,
             tooltip="حذف عکس مستندات",
             visible=False,
             on_click=self._handle_remove_evidence,
         )
 
         self.evidence_card = ft.Container(
-            padding=ft.Padding.all(10),
-            border_radius=ft.BorderRadius.all(10),
+            padding=ft.Padding.all(12),
+            border_radius=ft.BorderRadius.all(12),
             bgcolor="#161B22",
             border=ft.Border.all(1, ft.Colors.BLUE_GREY_800),
             content=ft.Column(
-                spacing=8,
+                spacing=10,
                 controls=[
                     ft.Row(
                         alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
@@ -139,12 +148,12 @@ class ViolationRegistrationPanel(ft.Container):
                                 controls=[
                                     ft.Icon(
                                         ft.Icons.ADD_A_PHOTO,
-                                        size=17,
+                                        size=19,
                                         color=ft.Colors.LIGHT_BLUE_300,
                                     ),
                                     ft.Text(
                                         "تصویر مستندات تخلف",
-                                        size=13,
+                                        size=14,
                                         weight=ft.FontWeight.W_600,
                                     ),
                                 ],
@@ -153,13 +162,13 @@ class ViolationRegistrationPanel(ft.Container):
                         ],
                     ),
                     ft.Row(
-                        spacing=10,
+                        spacing=12,
                         vertical_alignment=ft.CrossAxisAlignment.CENTER,
                         controls=[
                             self.evidence_preview_holder,
                             ft.Column(
                                 expand=True,
-                                spacing=4,
+                                spacing=6,
                                 controls=[
                                     self.evidence_status_text,
                                     ft.Row(
@@ -186,14 +195,14 @@ class ViolationRegistrationPanel(ft.Container):
                 controls=[
                     self.submit_progress,
                     ft.Icon(ft.Icons.SEND, size=18),
-                    ft.Text("ثبت نهایی تخلف", weight=ft.FontWeight.BOLD),
+                    ft.Text("ثبت نهایی تخلف", weight=ft.FontWeight.BOLD, size=14),
                 ],
             ),
             style=ft.ButtonStyle(
                 bgcolor=ft.Colors.RED_600,
                 color=ft.Colors.WHITE,
-                shape=ft.RoundedRectangleBorder(radius=10),
-                padding=ft.Padding.symmetric(horizontal=16, vertical=12),
+                shape=ft.RoundedRectangleBorder(radius=12),
+                padding=ft.Padding.symmetric(horizontal=16, vertical=14),
             ),
             expand=True,
             on_click=self._handle_submit_click,
@@ -205,65 +214,108 @@ class ViolationRegistrationPanel(ft.Container):
                 spacing=6,
                 controls=[
                     ft.Icon(ft.Icons.ARROW_FORWARD, size=18),
-                    ft.Text("بازگشت"),
+                    ft.Text("بازگشت", size=14),
                 ],
             ),
             style=ft.ButtonStyle(
-                shape=ft.RoundedRectangleBorder(radius=10),
-                padding=ft.Padding.symmetric(horizontal=14, vertical=12),
+                shape=ft.RoundedRectangleBorder(radius=12),
+                padding=ft.Padding.symmetric(horizontal=16, vertical=14),
             ),
             on_click=self._handle_back_click,
         )
 
         self.status_banner = ft.Text("", size=12, color=ft.Colors.RED_400, visible=False)
 
-        self.content = ft.Column(
-            spacing=10,
+        header_bar = ft.Container(
+            padding=ft.Padding.only(bottom=10),
+            border=ft.Border.only(bottom=ft.BorderSide(1, ft.Colors.BLUE_GREY_800)),
+            content=ft.Row(
+                alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                controls=[
+                    ft.Row(
+                        spacing=8,
+                        controls=[
+                            ft.Icon(ft.Icons.REPORT_PROBLEM, color=ft.Colors.RED_500, size=24),
+                            ft.Column(
+                                spacing=2,
+                                controls=[
+                                    ft.Text(
+                                        "ثبت تخلف خودرو",
+                                        size=17,
+                                        weight=ft.FontWeight.BOLD,
+                                    ),
+                                    self.datetime_badge,
+                                ],
+                            ),
+                        ],
+                    ),
+                    ft.IconButton(
+                        icon=ft.Icons.CLOSE,
+                        tooltip="بازگشت به صفحه اصلی",
+                        on_click=self._handle_back_click,
+                    ),
+                ],
+            ),
+        )
+
+        form_body = ft.Column(
+            spacing=14,
             scroll=ft.ScrollMode.AUTO,
             expand=True,
             controls=[
-                ft.Row(
-                    alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                ft.Column(
+                    spacing=6,
                     controls=[
-                        ft.Row(
-                            spacing=8,
-                            controls=[
-                                ft.Icon(ft.Icons.REPORT_PROBLEM, color=ft.Colors.RED_500, size=22),
-                                ft.Text(
-                                    "ثبت تخلف خودرو",
-                                    size=16,
-                                    weight=ft.FontWeight.BOLD,
-                                ),
-                            ],
+                        ft.Text(
+                            "شماره پلاک خودرو (قابل ویرایش مستقیم روی پلاک):",
+                            size=13,
+                            color=ft.Colors.WHITE_70,
+                            weight=ft.FontWeight.W_600,
                         ),
-                        ft.IconButton(
-                            icon=ft.Icons.CLOSE,
-                            tooltip="بازگشت به اطلاعات سرور",
-                            on_click=self._handle_back_click,
-                        ),
+                        self.plate_input,
                     ],
                 ),
-                self.plate_field,
                 ft.Row(controls=[self.violation_dropdown]),
                 self.notes_field,
-                ft.Row(
-                    alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                    controls=[
-                        self.attach_crop_checkbox,
-                        self.plate_crop_preview_holder,
-                    ],
+                ft.Container(
+                    padding=ft.Padding.symmetric(horizontal=10, vertical=8),
+                    border_radius=ft.BorderRadius.all(10),
+                    bgcolor="#161B22",
+                    border=ft.Border.all(1, ft.Colors.BLUE_GREY_800),
+                    content=ft.Row(
+                        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                        controls=[
+                            self.attach_crop_checkbox,
+                            self.plate_crop_preview_holder,
+                        ],
+                    ),
                 ),
                 self.evidence_card,
                 self.status_banner,
-                ft.Row(
-                    spacing=10,
-                    controls=[
-                        self.submit_button,
-                        self.cancel_button,
-                    ],
-                ),
+            ],
+        )
+
+        footer_actions = ft.Container(
+            padding=ft.Padding.only(top=10),
+            border=ft.Border.only(top=ft.BorderSide(1, ft.Colors.BLUE_GREY_800)),
+            content=ft.Row(
+                spacing=10,
+                controls=[
+                    self.submit_button,
+                    self.cancel_button,
+                ],
+            ),
+        )
+
+        self.content = ft.Column(
+            spacing=12,
+            expand=True,
+            controls=[
+                header_bar,
+                form_body,
+                footer_actions,
             ],
         )
 
@@ -272,9 +324,15 @@ class ViolationRegistrationPanel(ft.Container):
         plate_display: str,
         has_crop: bool,
         plate_crop_bytes: bytes | None = None,
+        chars_persian: list[str] | None = None,
     ) -> None:
-        """فرم را با اطلاعات آخرین پلاک تشخیص‌داده‌شده آماده و عکس مستندات قبلی را پاک می‌کند."""
-        self.plate_field.value = plate_display
+        """فرم را با اطلاعات آخرین پلاک و تاریخ شمسی فعلی آماده و عکس مستندات قبلی را پاک می‌کند."""
+        now_ir = now_iran_datetime()
+        j_date = format_jalali_date(now_ir, persian_digits=True)
+        j_time = format_jalali_time(now_ir, persian_digits=True)
+        self.datetime_badge.value = f"تاریخ شمسی: {j_date} | ساعت: {j_time}"
+
+        self.plate_input.set_plate(chars_persian=chars_persian, plate_text=plate_display)
         self.notes_field.value = ""
         self.attach_crop_checkbox.value = has_crop
         self.attach_crop_checkbox.disabled = not has_crop
@@ -282,8 +340,8 @@ class ViolationRegistrationPanel(ft.Container):
         if has_crop and plate_crop_bytes:
             self.plate_crop_preview_holder.content = ft.Image(
                 src=plate_crop_bytes,
-                width=92,
-                height=34,
+                width=104,
+                height=38,
                 fit=ft.BoxFit.CONTAIN,
                 border_radius=ft.BorderRadius.all(6),
             )
@@ -292,11 +350,12 @@ class ViolationRegistrationPanel(ft.Container):
             self.plate_crop_preview_holder.content = None
             self.plate_crop_preview_holder.visible = False
 
-        self._set_evidence_bytes(None)
+        self.set_evidence_bytes(None)
         self.status_banner.visible = False
         self.set_busy(False)
 
-    def _set_evidence_bytes(self, image_bytes: bytes | None) -> None:
+    def set_evidence_bytes(self, image_bytes: bytes | None) -> None:
+        """تصویر مستندات انتخاب یا ثبت‌شده را در فرم به‌روزرسانی می‌کند."""
         self._evidence_bytes = image_bytes
         if image_bytes:
             kb = max(1, int(round(len(image_bytes) / 1024)))
@@ -306,8 +365,8 @@ class ViolationRegistrationPanel(ft.Container):
             self.evidence_status_text.color = ft.Colors.GREEN_300
             self.evidence_preview_holder.content = ft.Image(
                 src=image_bytes,
-                width=84,
-                height=62,
+                width=96,
+                height=72,
                 fit=ft.BoxFit.COVER,
                 border_radius=ft.BorderRadius.all(8),
             )
@@ -340,22 +399,22 @@ class ViolationRegistrationPanel(ft.Container):
     def _handle_remove_evidence(self, _e=None) -> None:
         if self._submitting or self._capturing_evidence:
             return
-        self._set_evidence_bytes(None)
+        self.set_evidence_bytes(None)
         self.update()
 
     async def _handle_capture_evidence(self, _e=None) -> None:
         if self._submitting or self._capturing_evidence:
             return
         self._set_capturing(True)
-        self.evidence_status_text.value = "در حال ثبت تصویر از دوربین..."
+        self.evidence_status_text.value = "در حال باز کردن نمای دوربین برای ثبت مستندات..."
         self.evidence_status_text.color = ft.Colors.AMBER_300
         self.update()
         try:
             captured = await self._on_capture_evidence()
             if captured:
-                self._set_evidence_bytes(captured)
+                self.set_evidence_bytes(captured)
             else:
-                self._set_evidence_bytes(self._evidence_bytes)
+                self.set_evidence_bytes(self._evidence_bytes)
         finally:
             self._set_capturing(False)
             self.update()
@@ -370,9 +429,9 @@ class ViolationRegistrationPanel(ft.Container):
         try:
             picked = await self._on_pick_evidence()
             if picked:
-                self._set_evidence_bytes(picked)
+                self.set_evidence_bytes(picked)
             else:
-                self._set_evidence_bytes(self._evidence_bytes)
+                self.set_evidence_bytes(self._evidence_bytes)
         finally:
             self._set_capturing(False)
             self.update()
@@ -380,9 +439,11 @@ class ViolationRegistrationPanel(ft.Container):
     async def _handle_submit_click(self, _e=None) -> None:
         if self._submitting or self._capturing_evidence:
             return
-        plate_value = (self.plate_field.value or "").strip()
-        if not plate_value:
-            self.status_banner.value = "لطفاً شماره پلاک خودرو را وارد یا اسکن کنید."
+        plate_display, plate_latin, _ = self.plate_input.get_plate_values()
+        if not self.plate_input.is_complete():
+            self.status_banner.value = (
+                "لطفاً تمامی بخش‌های پلاک ایران (۲ رقم، حرف، ۳ رقم و کد ۲ رقمی ایران) را کامل وارد کنید."
+            )
             self.status_banner.visible = True
             self.update()
             return
@@ -392,7 +453,8 @@ class ViolationRegistrationPanel(ft.Container):
         self.update()
         try:
             await self._on_submit(
-                plate_value,
+                plate_display,
+                plate_latin,
                 self.violation_dropdown.value or VIOLATION_TYPES[0],
                 self.notes_field.value or "",
                 bool(self.attach_crop_checkbox.value),

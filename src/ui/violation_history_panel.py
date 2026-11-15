@@ -1,4 +1,4 @@
-"""بخش بازبینی تخلفات ثبت‌شده (نمایش لیست کامل تخلفات با امکان مشاهده تصاویر پلاک و مستندات)."""
+"""صفحه تمام‌صفحه بازبینی تخلفات ثبت‌شده (نمایش لیست کامل تخلفات با تاریخ شمسی، تصاویر و خروجی PDF)."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from services.api_client import ViolationRecord
 
 
 class ViolationHistoryPanel(ft.Container):
-    """پنل نمایش و بازبینی تخلفات ثبت‌شده در بخش پایینی صفحه اصلی."""
+    """صفحه تمام‌صفحه نمایش و بازبینی تخلفات ثبت‌شده."""
 
     def __init__(
         self,
@@ -19,25 +19,29 @@ class ViolationHistoryPanel(ft.Container):
         on_refresh: Callable[[], Awaitable[None]],
         on_select_record: Callable[[ViolationRecord], Awaitable[None]],
     ) -> None:
-        super().__init__(expand=True, padding=ft.Padding.all(12))
+        super().__init__(
+            expand=True,
+            bgcolor="#0D1117",
+            padding=ft.Padding.all(14),
+        )
         self._on_back = on_back
         self._on_refresh = on_refresh
         self._on_select_record = on_select_record
 
         self.title_text = ft.Text(
             "بازبینی تخلفات ثبت‌شده",
-            size=15,
+            size=17,
             weight=ft.FontWeight.BOLD,
         )
         self.count_badge = ft.Container(
-            padding=ft.Padding.symmetric(horizontal=8, vertical=2),
+            padding=ft.Padding.symmetric(horizontal=9, vertical=3),
             border_radius=ft.BorderRadius.all(12),
             bgcolor=ft.Colors.BLUE_800,
-            content=ft.Text("۰", size=11, color=ft.Colors.WHITE, weight=ft.FontWeight.BOLD),
+            content=ft.Text("۰", size=12, color=ft.Colors.WHITE, weight=ft.FontWeight.BOLD),
         )
 
         self.records_column = ft.Column(
-            spacing=8,
+            spacing=10,
             scroll=ft.ScrollMode.AUTO,
             expand=True,
             controls=[],
@@ -50,56 +54,68 @@ class ViolationHistoryPanel(ft.Container):
                 alignment=ft.MainAxisAlignment.CENTER,
                 controls=[
                     ft.Icon(ft.Icons.ARROW_FORWARD, size=18),
-                    ft.Text("بازگشت به صفحه اصلی"),
+                    ft.Text("بازگشت به صفحه اصلی", size=14),
                 ],
             ),
             style=ft.ButtonStyle(
-                shape=ft.RoundedRectangleBorder(radius=10),
-                padding=ft.Padding.symmetric(horizontal=14, vertical=10),
+                shape=ft.RoundedRectangleBorder(radius=12),
+                padding=ft.Padding.symmetric(horizontal=16, vertical=13),
             ),
             width=float("inf"),
             on_click=lambda _: self._on_back(),
         )
 
+        header_bar = ft.Container(
+            padding=ft.Padding.only(bottom=10),
+            border=ft.Border.only(bottom=ft.BorderSide(1, ft.Colors.BLUE_GREY_800)),
+            content=ft.Row(
+                alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                controls=[
+                    ft.Row(
+                        spacing=8,
+                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                        controls=[
+                            ft.Icon(ft.Icons.HISTORY, color=ft.Colors.LIGHT_BLUE_300, size=24),
+                            self.title_text,
+                            self.count_badge,
+                        ],
+                    ),
+                    ft.Row(
+                        spacing=0,
+                        controls=[
+                            ft.IconButton(
+                                icon=ft.Icons.REFRESH,
+                                tooltip="بروزرسانی فهرست",
+                                on_click=self._handle_refresh,
+                            ),
+                            ft.IconButton(
+                                icon=ft.Icons.CLOSE,
+                                tooltip="بازگشت",
+                                on_click=lambda _: self._on_back(),
+                            ),
+                        ],
+                    ),
+                ],
+            ),
+        )
+
+        footer_bar = ft.Container(
+            padding=ft.Padding.only(top=10),
+            border=ft.Border.only(top=ft.BorderSide(1, ft.Colors.BLUE_GREY_800)),
+            content=self.back_button,
+        )
+
         self.content = ft.Column(
-            spacing=10,
+            spacing=12,
             expand=True,
             controls=[
-                ft.Row(
-                    alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                    controls=[
-                        ft.Row(
-                            spacing=8,
-                            vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                            controls=[
-                                ft.Icon(ft.Icons.HISTORY, color=ft.Colors.LIGHT_BLUE_300, size=22),
-                                self.title_text,
-                                self.count_badge,
-                            ],
-                        ),
-                        ft.Row(
-                            spacing=0,
-                            controls=[
-                                ft.IconButton(
-                                    icon=ft.Icons.REFRESH,
-                                    tooltip="بروزرسانی فهرست",
-                                    on_click=self._handle_refresh,
-                                ),
-                                ft.IconButton(
-                                    icon=ft.Icons.CLOSE,
-                                    tooltip="بازگشت",
-                                    on_click=lambda _: self._on_back(),
-                                ),
-                            ],
-                        ),
-                    ],
-                ),
+                header_bar,
                 ft.Container(
                     expand=True,
                     content=self.records_column,
                 ),
-                self.back_button,
+                footer_bar,
             ],
         )
 
@@ -230,14 +246,21 @@ class ViolationHistoryPanel(ft.Container):
                 controls=[
                     ft.Text(
                         rec.violation_type,
-                        size=12,
+                        size=13,
                         color=ft.Colors.AMBER_300,
                         weight=ft.FontWeight.W_600,
                     ),
-                    ft.Text(
-                        to_persian_digits(rec.local_time or "---"),
-                        size=10,
-                        color=ft.Colors.WHITE_60,
+                    ft.Row(
+                        tight=True,
+                        spacing=4,
+                        controls=[
+                            ft.Icon(ft.Icons.CALENDAR_TODAY, size=12, color=ft.Colors.LIGHT_BLUE_200),
+                            ft.Text(
+                                rec.display_jalali_datetime or "---",
+                                size=11,
+                                color=ft.Colors.WHITE_70,
+                            ),
+                        ],
                     ),
                 ],
             ),

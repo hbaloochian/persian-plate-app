@@ -1,12 +1,12 @@
 """نقطه ورود اصلی اپلیکیشن اندروید «پلاک‌خوان هوشمند» با Flet 1.0 + ONNX Runtime.
 
-ساختار صفحه اصلی:
-- بخش بالا (55% صفحه): نمایش زنده دوربین گوشی + رسم کادرهای رنگی (آبی -> قرمز/سبز)
-- بخش پایین (45% صفحه):
-    1) حالت پیش‌فرض: نمایش گرافیکی استاندارد پلاک ایران، اطلاعات دریافتی از سرور myweb.web.com
-       و دکمه‌های «ثبت تخلف» و «بازبینی تخلفات»
-    2) حالت ثبت تخلف: فرم ثبت تخلف همراه با پیوست تصویر برش‌خورده پلاک و عکس مستندات (دوربین/گالری)
-    3) حالت بازبینی تخلفات: فهرست تخلفات ثبت‌شده با امکان مشاهده تصاویر، ارسال مجدد و حذف
+ساختار رابط کاربری:
+- صفحه اصلی (دوبخشی):
+    • بخش بالا (55% صفحه): نمایش زنده دوربین گوشی + رسم کادرهای رنگی (آبی -> قرمز/سبز)
+    • بخش پایین (45% صفحه): نمایش گرافیکی استاندارد پلاک ایران، اطلاعات دریافتی از سرور myweb.web.com
+      و دکمه‌های «استعلام پلاک»، «ثبت تخلف» و «بازبینی تخلفات ثبت‌شده»
+- صفحه تمام‌صفحه «ثبت تخلف»: ورودی پلاک به شکل گرافیکی پلاک ایران + تاریخ شمسی و ساعت + پیوست تصویر پلاک و مستندات
+- صفحه تمام‌صفحه «بازبینی تخلفات»: لیست کامل تخلفات با تاریخ شمسی، پنجره جزئیات تک‌ردیفه و تولید گزارش PDF در پوشه دانلود
 """
 
 from __future__ import annotations
@@ -30,7 +30,7 @@ SRC_DIR = Path(__file__).resolve().parent
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from config import AppSettings, to_persian_digits
+from config import load_settings, save_settings, to_persian_digits
 from core.geometry import compute_android_rotation_degrees, rotate_pil_clockwise
 from core.plate_detector import FrameInferenceResult, PersianPlateEngine, PlateDetection
 from services.api_client import (
@@ -41,6 +41,12 @@ from services.api_client import (
     delete_violation_record,
     load_violation_records,
     read_violation_image_bytes,
+)
+from services.pdf_report import (
+    build_violation_pdf_filename,
+    generate_violation_pdf_bytes,
+    save_pdf_backup_in_app_storage,
+    try_write_pdf_to_downloads,
 )
 from ui.components import (
     build_iranian_plate_widget,
@@ -89,8 +95,10 @@ class AppRuntimeState:
     selected_plate: PlateDetection | None = None
     last_api_result: ApiCheckResult | None = None
 
-    # حالت بخش پایینی صفحه: "info" | "violation" | "history"
-    bottom_mode: str = "info"
+    # حالت فعلی نمایش برنامه: "info" | "violation" | "history" | "evidence_camera"
+    screen_mode: str = "info"
+    manual_query_busy: bool = False
+    evidence_capture_future: asyncio.Future[bytes | None] | None = None
 
 
 def _device_orientation_to_degrees(orientation: ft.DeviceOrientation | None) -> int:
@@ -138,7 +146,8 @@ async def main(page: ft.Page) -> None:
     page.bgcolor = ft.Colors.GREY_950 if hasattr(ft.Colors, "GREY_950") else "#0D1117"
     page.theme = ft.Theme(color_scheme_seed=ft.Colors.BLUE)
 
-    settings = AppSettings()
+    # بارگذاری تنظیمات ذخیره‌شده (حالت استعلام خودکار به‌صورت پیش‌فرض غیرفعال است)
+    settings = load_settings()
     state = AppRuntimeState()
     engine = PersianPlateEngine(settings=settings)
     api_client = PlateApiClient(settings=settings)
@@ -197,7 +206,7 @@ async def main(page: ft.Page) -> None:
     settings_btn = ft.IconButton(
         icon=ft.Icons.SETTINGS,
         icon_color=ft.Colors.WHITE,
-        tooltip="تنظیمات آدرس سرور",
+        tooltip="تنظیمات سرور و استعلام خودکار",
         icon_size=22,
     )
 
@@ -291,7 +300,7 @@ async def main(page: ft.Page) -> None:
     )
 
     # -----------------------------------------------------------------------
-    # کنترل‌های بخش پایین صفحه (اطلاعات سرور <-> ثبت تخلف <-> بازبینی تخلفات)
+    # کنترل‌های بخش پایین صفحه اصلی (اطلاعات سرور + دکمه‌های عملیاتی)
     # -----------------------------------------------------------------------
     plate_widget_holder = ft.Container(
         content=build_iranian_plate_widget([], PlateCheckStatus.PENDING)
@@ -305,7 +314,7 @@ async def main(page: ft.Page) -> None:
         weight=ft.FontWeight.BOLD,
     )
     status_chip = ft.Container(
-        padding=ft.Padding.symmetric(horizontal=12, vertical=8),
+        padding=ft.Padding.symmetric(horizontal=12, vertical=7),
         border_radius=ft.BorderRadius.all(10),
         bgcolor=ft.Colors.BLUE_GREY_800,
         content=ft.Row(
@@ -316,11 +325,11 @@ async def main(page: ft.Page) -> None:
     )
 
     server_details_column = ft.Column(
-        spacing=6,
+        spacing=5,
         controls=[
             ft.Text(
                 "دوربین گوشی را به سمت پلاک خودرو بگیرید. پس از تشخیص محلی (کادر آبی)، "
-                "نتیجه استعلام از سرور myweb.web.com در این بخش نمایش داده می‌شود.",
+                "برای استعلام از سرور دکمه «استعلام پلاک» را بزنید یا حالت استعلام خودکار را از تنظیمات فعال کنید.",
                 size=12,
                 color=ft.Colors.WHITE_70,
             )
@@ -340,48 +349,69 @@ async def main(page: ft.Page) -> None:
         ),
     )
 
+    # دکمه جدید «استعلام پلاک» در صفحه اصلی برای ارسال دستی پلاک به سرور
+    query_plate_progress = ft.ProgressRing(width=15, height=15, stroke_width=2, visible=False)
+    query_plate_btn = ft.FilledButton(
+        content=ft.Row(
+            alignment=ft.MainAxisAlignment.CENTER,
+            spacing=6,
+            controls=[
+                query_plate_progress,
+                ft.Icon(ft.Icons.CLOUD_SYNC, size=18),
+                ft.Text("استعلام پلاک", size=13, weight=ft.FontWeight.BOLD),
+            ],
+        ),
+        style=ft.ButtonStyle(
+            bgcolor=ft.Colors.BLUE_600,
+            color=ft.Colors.WHITE,
+            shape=ft.RoundedRectangleBorder(radius=11),
+            padding=ft.Padding.symmetric(horizontal=8, vertical=11),
+        ),
+        expand=1,
+    )
+
     register_violation_btn = ft.FilledButton(
         content=ft.Row(
             alignment=ft.MainAxisAlignment.CENTER,
             spacing=6,
             controls=[
-                ft.Icon(ft.Icons.REPORT_PROBLEM, size=19),
-                ft.Text("ثبت تخلف", size=14, weight=ft.FontWeight.BOLD),
+                ft.Icon(ft.Icons.REPORT_PROBLEM, size=18),
+                ft.Text("ثبت تخلف", size=13, weight=ft.FontWeight.BOLD),
             ],
         ),
         style=ft.ButtonStyle(
             bgcolor=ft.Colors.RED_600,
             color=ft.Colors.WHITE,
-            shape=ft.RoundedRectangleBorder(radius=12),
-            padding=ft.Padding.symmetric(horizontal=10, vertical=13),
+            shape=ft.RoundedRectangleBorder(radius=11),
+            padding=ft.Padding.symmetric(horizontal=8, vertical=11),
         ),
-        expand=3,
+        expand=1,
     )
 
-    review_violations_label = ft.Text("بازبینی تخلفات", size=13, weight=ft.FontWeight.BOLD)
+    review_violations_label = ft.Text("بازبینی تخلفات ثبت‌شده", size=13, weight=ft.FontWeight.BOLD)
     review_violations_btn = ft.FilledButton(
         content=ft.Row(
             alignment=ft.MainAxisAlignment.CENTER,
             spacing=6,
             controls=[
-                ft.Icon(ft.Icons.HISTORY, size=19),
+                ft.Icon(ft.Icons.HISTORY, size=18),
                 review_violations_label,
             ],
         ),
         style=ft.ButtonStyle(
             bgcolor=ft.Colors.BLUE_GREY_700,
             color=ft.Colors.WHITE,
-            shape=ft.RoundedRectangleBorder(radius=12),
-            padding=ft.Padding.symmetric(horizontal=10, vertical=13),
+            shape=ft.RoundedRectangleBorder(radius=11),
+            padding=ft.Padding.symmetric(horizontal=10, vertical=10),
         ),
-        expand=2,
+        width=float("inf"),
     )
 
     server_info_view = ft.Container(
         expand=True,
-        padding=ft.Padding.all(12),
+        padding=ft.Padding.all(10),
         content=ft.Column(
-            spacing=10,
+            spacing=8,
             expand=True,
             controls=[
                 plate_widget_holder,
@@ -390,8 +420,87 @@ async def main(page: ft.Page) -> None:
                 ft.Row(
                     spacing=8,
                     controls=[
+                        query_plate_btn,
                         register_violation_btn,
-                        review_violations_btn,
+                    ],
+                ),
+                review_violations_btn,
+            ],
+        ),
+    )
+
+    bottom_section_container = ft.Container(
+        expand=4,
+        bgcolor="#0F141B",
+        border=ft.Border(top=ft.BorderSide(width=1, color=ft.Colors.BLUE_GREY_800)),
+        content=server_info_view,
+    )
+
+    # لایه تمام‌صفحه برای «ثبت تخلف» و «بازبینی تخلفات»
+    # (دوربین زنده در لایه زیرین فعال می‌ماند تا بازگشت فوری و عکس‌برداری مستندات بی‌وقفه باشد)
+    fullscreen_overlay = ft.Container(
+        expand=True,
+        bgcolor="#0D1117",
+        visible=False,
+    )
+
+    # نوار کمکی هنگام گرفتن عکس مستندات از دوربین زنده (در حالت تمام‌صفحه ثبت تخلف)
+    evidence_shutter_progress = ft.ProgressRing(width=18, height=18, stroke_width=2, visible=False)
+    evidence_shutter_btn = ft.FilledButton(
+        content=ft.Row(
+            alignment=ft.MainAxisAlignment.CENTER,
+            spacing=8,
+            controls=[
+                evidence_shutter_progress,
+                ft.Icon(ft.Icons.CAMERA_ALT, size=20),
+                ft.Text("گرفتن عکس مستندات", size=14, weight=ft.FontWeight.BOLD),
+            ],
+        ),
+        style=ft.ButtonStyle(
+            bgcolor=ft.Colors.GREEN_600,
+            color=ft.Colors.WHITE,
+            shape=ft.RoundedRectangleBorder(radius=12),
+            padding=ft.Padding.symmetric(horizontal=16, vertical=14),
+        ),
+        expand=True,
+    )
+    evidence_cancel_btn = ft.OutlinedButton(
+        content="انصراف",
+        style=ft.ButtonStyle(
+            shape=ft.RoundedRectangleBorder(radius=12),
+            padding=ft.Padding.symmetric(horizontal=16, vertical=14),
+        ),
+    )
+    evidence_capture_overlay = ft.Container(
+        left=0,
+        right=0,
+        bottom=0,
+        padding=ft.Padding.all(14),
+        bgcolor=ft.Colors.with_opacity(0.92, "#0F141B"),
+        border=ft.Border(top=ft.BorderSide(1, ft.Colors.BLUE_GREY_700)),
+        visible=False,
+        content=ft.Column(
+            tight=True,
+            spacing=10,
+            controls=[
+                ft.Row(
+                    spacing=8,
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    controls=[
+                        ft.Icon(ft.Icons.ADD_A_PHOTO, color=ft.Colors.GREEN_400, size=20),
+                        ft.Text(
+                            "دوربین را به سمت خودرو یا صحنه تخلف بگیرید و دکمه ثبت عکس را بزنید.",
+                            size=13,
+                            color=ft.Colors.WHITE,
+                            expand=True,
+                        ),
+                    ],
+                ),
+                ft.Row(
+                    spacing=10,
+                    controls=[
+                        evidence_shutter_btn,
+                        evidence_cancel_btn,
                     ],
                 ),
             ],
@@ -399,7 +508,7 @@ async def main(page: ft.Page) -> None:
     )
 
     # -----------------------------------------------------------------------
-    # توابع کمکی بروزرسانی رابط کاربری و تعویض بخش پایینی صفحه
+    # توابع کمکی رابط کاربری و جابجایی بین صفحه اصلی و صفحات تمام‌صفحه
     # -----------------------------------------------------------------------
     def show_snackbar(message: str, is_error: bool = False) -> None:
         page.show_dialog(
@@ -413,11 +522,11 @@ async def main(page: ft.Page) -> None:
         records = await asyncio.to_thread(load_violation_records)
         count = len(records)
         review_violations_label.value = (
-            f"بازبینی تخلفات ({to_persian_digits(str(count))})"
+            f"بازبینی تخلفات ثبت‌شده ({to_persian_digits(str(count))})"
             if count > 0
-            else "بازبینی تخلفات"
+            else "بازبینی تخلفات ثبت‌شده"
         )
-        if update_ui and state.bottom_mode == "info":
+        if update_ui and state.screen_mode == "info":
             review_violations_label.update()
         return records
 
@@ -427,57 +536,13 @@ async def main(page: ft.Page) -> None:
             and state.selected_camera.lens_direction == fc.CameraLensDirection.FRONT
         )
         overlay_canvas.shapes = build_overlay_shapes(
-            plates=state.active_plates,
+            plates=state.active_plates if state.screen_mode == "info" else [],
             plate_statuses=state.plate_statuses,
             canvas_width=state.canvas_width,
             canvas_height=state.canvas_height,
             mirror_x=mirror_x,
         )
         overlay_canvas.update()
-
-    def render_server_info_panel() -> None:
-        plate = state.selected_plate
-        api_res = state.last_api_result
-
-        if plate is None:
-            plate_widget_holder.content = build_iranian_plate_widget([], PlateCheckStatus.PENDING)
-            status_chip.bgcolor = ft.Colors.BLUE_GREY_800
-            status_chip_icon.name = ft.Icons.SEARCH
-            status_chip_label.value = "در انتظار تشخیص پلاک خودرو..."
-            return
-
-        plate_key = plate.plate_latin or plate.plate_persian
-        current_status = state.plate_statuses.get(plate_key, PlateCheckStatus.PENDING)
-        plate_widget_holder.content = build_iranian_plate_widget(plate.chars_persian, current_status)
-
-        title, bg_color, icon_name = status_to_badge_info(current_status)
-        status_chip.bgcolor = bg_color
-        status_chip_icon.name = icon_name
-        status_chip_label.value = title
-
-        rows: list[ft.Control] = [
-            _info_row("پلاک تشخیص‌داده‌شده", plate.display_text),
-            _info_row("کد لاتین ارسالی به سرور", plate.plate_latin or "---"),
-            _info_row("دقت مدل محلی", to_persian_digits(f"{int(plate.confidence * 100)}٪")),
-        ]
-
-        if api_res is not None:
-            rows.append(ft.Divider(height=8, color=ft.Colors.BLUE_GREY_800))
-            if api_res.error_message:
-                rows.append(_info_row("وضعیت ارتباط", api_res.error_message, value_color=ft.Colors.ORANGE_300))
-            else:
-                rows.append(_info_row("زمان استعلام", to_persian_digits(api_res.checked_at)))
-                rows.append(_info_row("سرعت پاسخ سرور", to_persian_digits(f"{int(api_res.latency_ms)} میلی‌ثانیه")))
-                for key, val in api_res.details.items():
-                    rows.append(_info_row(str(key), str(val)))
-        else:
-            if not engine.single_stage_mode and not plate.complete:
-                rows.append(_info_row("وضعیت", "در حال خوانش کامل ۸ کاراکتر پلاک (کادر آبی)..."))
-            else:
-                rows.append(_info_row("آدرس API", settings.check_url))
-                rows.append(_info_row("وضعیت", "در حال ارسال پلاک به سرور..."))
-
-        server_details_column.controls = rows
 
     def _info_row(label: str, value: str, value_color: str = ft.Colors.WHITE) -> ft.Row:
         return ft.Row(
@@ -496,15 +561,84 @@ async def main(page: ft.Page) -> None:
             ],
         )
 
+    def render_server_info_panel() -> None:
+        plate = state.selected_plate
+        api_res = state.last_api_result
+
+        if plate is None:
+            plate_widget_holder.content = build_iranian_plate_widget([], PlateCheckStatus.PENDING)
+            status_chip.bgcolor = ft.Colors.BLUE_GREY_800
+            status_chip_icon.name = ft.Icons.SEARCH
+            mode_note = "خودکار" if settings.auto_query_enabled else "دستی"
+            status_chip_label.value = f"در انتظار تشخیص پلاک (استعلام {mode_note})"
+            return
+
+        plate_key = plate.plate_latin or plate.plate_persian
+        current_status = state.plate_statuses.get(plate_key, PlateCheckStatus.PENDING)
+        plate_widget_holder.content = build_iranian_plate_widget(plate.chars_persian, current_status)
+
+        title, bg_color, icon_name = status_to_badge_info(
+            current_status,
+            auto_query_enabled=settings.auto_query_enabled or state.manual_query_busy,
+        )
+        status_chip.bgcolor = bg_color
+        status_chip_icon.name = icon_name
+        status_chip_label.value = title
+
+        rows: list[ft.Control] = [
+            _info_row("پلاک تشخیص‌داده‌شده", plate.display_text),
+            _info_row("کد لاتین ارسالی به سرور", plate.plate_latin or "---"),
+            _info_row("دقت مدل محلی", to_persian_digits(f"{int(plate.confidence * 100)}٪")),
+            _info_row(
+                "حالت استعلام",
+                "خودکار" if settings.auto_query_enabled else "دستی (با دکمه استعلام پلاک)",
+                value_color=ft.Colors.LIGHT_BLUE_200,
+            ),
+        ]
+
+        if api_res is not None:
+            rows.append(ft.Divider(height=8, color=ft.Colors.BLUE_GREY_800))
+            if api_res.error_message:
+                rows.append(_info_row("وضعیت ارتباط", api_res.error_message, value_color=ft.Colors.ORANGE_300))
+            else:
+                rows.append(_info_row("زمان استعلام", to_persian_digits(api_res.checked_at)))
+                rows.append(_info_row("سرعت پاسخ سرور", to_persian_digits(f"{int(api_res.latency_ms)} میلی‌ثانیه")))
+                for key, val in api_res.details.items():
+                    rows.append(_info_row(str(key), str(val)))
+        else:
+            if not engine.single_stage_mode and not plate.complete:
+                rows.append(_info_row("وضعیت", "در حال خوانش کامل ۸ کاراکتر پلاک (کادر آبی)..."))
+            elif settings.auto_query_enabled or state.manual_query_busy:
+                rows.append(_info_row("آدرس API", settings.check_url))
+                rows.append(_info_row("وضعیت", "در حال ارسال پلاک به سرور..."))
+            else:
+                rows.append(
+                    _info_row(
+                        "راهنما",
+                        "برای ارسال به سرور، دکمه «استعلام پلاک» را فشار دهید.",
+                        value_color=ft.Colors.LIGHT_BLUE_200,
+                    )
+                )
+
+        server_details_column.controls = rows
+
     def switch_to_info_view() -> None:
-        state.bottom_mode = "info"
-        bottom_section_container.content = server_info_view
+        state.screen_mode = "info"
+        fullscreen_overlay.visible = False
+        fullscreen_overlay.content = None
+        evidence_capture_overlay.visible = False
         render_server_info_panel()
-        bottom_section_container.update()
+        refresh_overlay_boxes()
+        page.update()
 
     def switch_to_violation_view(_e=None) -> None:
-        state.bottom_mode = "violation"
+        state.screen_mode = "violation"
         plate_text = state.selected_plate.display_text if state.selected_plate else ""
+        plate_chars = (
+            state.selected_plate.chars_persian
+            if state.selected_plate is not None
+            else None
+        )
         crop_bytes = (
             state.selected_plate.plate_crop_jpeg
             if state.selected_plate is not None
@@ -514,52 +648,120 @@ async def main(page: ft.Page) -> None:
             plate_display=plate_text,
             has_crop=crop_bytes is not None,
             plate_crop_bytes=crop_bytes,
+            chars_persian=plate_chars,
         )
-        bottom_section_container.content = violation_panel
-        bottom_section_container.update()
+        fullscreen_overlay.content = violation_panel
+        fullscreen_overlay.visible = True
+        evidence_capture_overlay.visible = False
+        page.update()
+
+    async def switch_to_history_view(_e=None) -> None:
+        state.screen_mode = "history"
+        records = await refresh_violation_counter(update_ui=False)
+        violation_history_panel.set_records(records)
+        fullscreen_overlay.content = violation_history_panel
+        fullscreen_overlay.visible = True
+        evidence_capture_overlay.visible = False
+        page.update()
+
+    async def reload_history_panel() -> None:
+        records = await refresh_violation_counter(update_ui=False)
+        violation_history_panel.set_records(records)
+        if state.screen_mode == "history":
+            fullscreen_overlay.update()
+
+    # -----------------------------------------------------------------------
+    # ثبت عکس مستندات از دوربین زنده (با نمایش نمای دوربین برای کادربندی دقیق)
+    # -----------------------------------------------------------------------
+    async def _perform_camera_snapshot() -> bytes | None:
+        was_streaming = state.is_streaming
+        prev_paused = state.is_paused
+        state.is_paused = True
+        captured_bytes: bytes | None = None
+        try:
+            if was_streaming:
+                try:
+                    await camera_control.stop_image_stream()
+                    state.is_streaming = False
+                except Exception as exc:
+                    logger.warning("Could not pause stream before take_picture: %s", exc)
+
+            raw_photo = await camera_control.take_picture()
+            if raw_photo:
+                captured_bytes = await asyncio.to_thread(_normalize_evidence_jpeg, raw_photo, 0)
+        except Exception as exc:
+            logger.warning("take_picture failed, falling back to latest stream frame: %s", exc)
+            if state.last_raw_frame_bytes:
+                try:
+                    captured_bytes = await asyncio.to_thread(
+                        _normalize_evidence_jpeg,
+                        state.last_raw_frame_bytes,
+                        state.last_raw_frame_rotation,
+                    )
+                except Exception as fallback_exc:
+                    logger.warning("Fallback frame encoding failed: %s", fallback_exc)
+        finally:
+            if was_streaming and not state.is_streaming:
+                try:
+                    await camera_control.start_image_stream()
+                    state.is_streaming = True
+                except Exception as exc:
+                    logger.warning("Could not resume image stream after take_picture: %s", exc)
+            state.is_paused = prev_paused
+        return captured_bytes
+
+    async def _on_evidence_shutter_click(_e=None) -> None:
+        fut = state.evidence_capture_future
+        if fut is None or fut.done():
+            return
+        evidence_shutter_progress.visible = True
+        evidence_shutter_btn.disabled = True
+        evidence_cancel_btn.disabled = True
+        evidence_capture_overlay.update()
+        try:
+            photo_bytes = await _perform_camera_snapshot()
+            if not fut.done():
+                fut.set_result(photo_bytes)
+        finally:
+            evidence_shutter_progress.visible = False
+            evidence_shutter_btn.disabled = False
+            evidence_cancel_btn.disabled = False
+
+    def _on_evidence_cancel_click(_e=None) -> None:
+        fut = state.evidence_capture_future
+        if fut is not None and not fut.done():
+            fut.set_result(None)
+
+    evidence_shutter_btn.on_click = _on_evidence_shutter_click
+    evidence_cancel_btn.on_click = _on_evidence_cancel_click
 
     async def handle_capture_evidence_photo() -> bytes | None:
-        """ثبت عکس مستندات از دوربین زنده (با پشتیبان آخرین فریم دوربین در صورت محدودیت سخت‌افزاری)."""
+        """نمای زنده دوربین را برای کادربندی عکس مستندات نمایش می‌دهد و تصویر گرفته‌شده را برمی‌گرداند."""
         if state.is_camera_ready:
-            was_streaming = state.is_streaming
-            prev_paused = state.is_paused
-            state.is_paused = True
-            captured_bytes: bytes | None = None
-            try:
-                if was_streaming:
-                    try:
-                        await camera_control.stop_image_stream()
-                        state.is_streaming = False
-                    except Exception as exc:
-                        logger.warning("Could not pause stream before take_picture: %s", exc)
+            loop = asyncio.get_running_loop()
+            fut: asyncio.Future[bytes | None] = loop.create_future()
+            state.evidence_capture_future = fut
+            state.screen_mode = "evidence_camera"
 
-                raw_photo = await camera_control.take_picture()
-                if raw_photo:
-                    captured_bytes = await asyncio.to_thread(_normalize_evidence_jpeg, raw_photo, 0)
-            except Exception as exc:
-                logger.warning("take_picture failed, falling back to latest stream frame: %s", exc)
-                if state.last_raw_frame_bytes:
-                    try:
-                        captured_bytes = await asyncio.to_thread(
-                            _normalize_evidence_jpeg,
-                            state.last_raw_frame_bytes,
-                            state.last_raw_frame_rotation,
-                        )
-                    except Exception as fallback_exc:
-                        logger.warning("Fallback frame encoding failed: %s", fallback_exc)
+            # مخفی کردن موقت فرم تمام‌صفحه تا کاربر بتواند صحنه تخلف را در دوربین ببیند
+            fullscreen_overlay.visible = False
+            evidence_capture_overlay.visible = True
+            refresh_overlay_boxes()
+            page.update()
+
+            try:
+                captured_bytes = await fut
             finally:
-                if was_streaming and not state.is_streaming:
-                    try:
-                        await camera_control.start_image_stream()
-                        state.is_streaming = True
-                    except Exception as exc:
-                        logger.warning("Could not resume image stream after take_picture: %s", exc)
-                state.is_paused = prev_paused
+                state.evidence_capture_future = None
+                state.screen_mode = "violation"
+                evidence_capture_overlay.visible = False
+                fullscreen_overlay.content = violation_panel
+                fullscreen_overlay.visible = True
+                page.update()
 
             if captured_bytes:
                 show_snackbar("عکس مستندات با دوربین ثبت شد.")
                 return captured_bytes
-            show_snackbar("ثبت عکس با دوربین ناموفق بود؛ می‌توانید از گالری انتخاب کنید.", is_error=True)
             return None
 
         # در حالت پیش‌نمایش دسکتاپ یک تصویر مستندات نمونه تولید می‌شود
@@ -598,12 +800,13 @@ async def main(page: ft.Page) -> None:
 
     async def handle_violation_submit(
         plate_text: str,
+        plate_latin: str,
         violation_type: str,
         notes: str,
         attach_crop: bool,
         evidence_bytes: bytes | None,
     ) -> None:
-        plate_latin = state.selected_plate.plate_latin if state.selected_plate else ""
+        final_latin = plate_latin or (state.selected_plate.plate_latin if state.selected_plate else "")
         crop_bytes = (
             state.selected_plate.plate_crop_jpeg
             if (attach_crop and state.selected_plate is not None)
@@ -611,7 +814,7 @@ async def main(page: ft.Page) -> None:
         )
         result = await api_client.submit_violation(
             plate_persian=plate_text,
-            plate_latin=plate_latin,
+            plate_latin=final_latin,
             violation_type=violation_type,
             description=notes,
             plate_crop_jpeg=crop_bytes,
@@ -622,31 +825,28 @@ async def main(page: ft.Page) -> None:
         if result.success or result.saved_locally:
             switch_to_info_view()
 
-    async def reload_history_panel() -> None:
-        records = await refresh_violation_counter(update_ui=False)
-        violation_history_panel.set_records(records)
-        if state.bottom_mode == "history":
-            bottom_section_container.update()
-
-    async def switch_to_history_view(_e=None) -> None:
-        state.bottom_mode = "history"
-        records = await refresh_violation_counter(update_ui=False)
-        violation_history_panel.set_records(records)
-        bottom_section_container.content = violation_history_panel
-        bottom_section_container.update()
-
+    # -----------------------------------------------------------------------
+    # پنجره جزئیات تخلف (تمامی دکمه‌ها در یک ردیف + دکمه «گزارش» PDF در پوشه دانلود)
+    # -----------------------------------------------------------------------
     async def open_violation_detail_dialog(record: ViolationRecord) -> None:
-        """نمایش جزئیات کامل یک تخلف ثبت‌شده شامل تصویر برش پلاک، عکس مستندات، ارسال مجدد و حذف."""
+        """نمایش جزئیات کامل تخلف با تاریخ شمسی، تصاویر، دکمه‌های تک‌ردیفه و خروجی PDF."""
         plate_bytes = await asyncio.to_thread(read_violation_image_bytes, record.plate_image_file)
         evidence_bytes = await asyncio.to_thread(
             read_violation_image_bytes,
             record.evidence_image_file,
         )
 
+        jalali_date_str = to_persian_digits(record.jalali_date or "---")
+        if record.jalali_weekday:
+            jalali_date_str = f"{record.jalali_weekday} ({jalali_date_str})"
+        jalali_time_str = to_persian_digits(record.jalali_time or "---")
+
         detail_controls: list[ft.Control] = [
-            _info_row("پلاک", record.plate),
+            _info_row("پلاک خودرو", to_persian_digits(record.plate)),
+            _info_row("کد لاتین پلاک", record.plate_latin or "---"),
             _info_row("نوع تخلف", record.violation_type, value_color=ft.Colors.AMBER_300),
-            _info_row("زمان ثبت", to_persian_digits(record.local_time or "---")),
+            _info_row("تاریخ شمسی", jalali_date_str, value_color=ft.Colors.LIGHT_BLUE_200),
+            _info_row("ساعت ثبت", jalali_time_str, value_color=ft.Colors.LIGHT_BLUE_200),
             _info_row(
                 "وضعیت ارسال",
                 "ارسال‌شده به سرور" if record.synced else "ذخیره‌شده روی گوشی (ارسال‌نشده)",
@@ -707,6 +907,77 @@ async def main(page: ft.Page) -> None:
                 )
             )
 
+        pdf_progress = ft.ProgressRing(width=13, height=13, stroke_width=2, visible=False)
+        pdf_btn_ref: list[ft.FilledButton] = []
+
+        async def handle_export_pdf(_ev) -> None:
+            btn = pdf_btn_ref[0]
+            btn.disabled = True
+            pdf_progress.visible = True
+            btn.update()
+            try:
+                filename = build_violation_pdf_filename(record)
+                pdf_bytes = await asyncio.to_thread(
+                    generate_violation_pdf_bytes,
+                    record,
+                    plate_bytes,
+                    evidence_bytes,
+                )
+                # ذخیره همیشگی یک نسخه پشتیبان مطمئن در حافظه داخلی برنامه
+                backup_path = await asyncio.to_thread(
+                    save_pdf_backup_in_app_storage,
+                    pdf_bytes,
+                    filename,
+                )
+
+                # تلاش اول: نوشتن مستقیم در پوشه Downloads
+                wrote_direct, saved_path, _err = await asyncio.to_thread(
+                    try_write_pdf_to_downloads,
+                    pdf_bytes,
+                    filename,
+                )
+                if wrote_direct and saved_path is not None:
+                    show_snackbar(
+                        f"گزارش PDF با نام «{filename}» در پوشه Downloads ذخیره شد."
+                    )
+                    return
+
+                # تلاش دوم (اندروید ۱۰ تا ۱۵ با Scoped Storage): ذخیره امن در پوشه Download از طریق SAF
+                try:
+                    saved_uri = await file_picker.save_file(
+                        dialog_title="ذخیره گزارش PDF تخلف در پوشه دانلود",
+                        file_name=filename,
+                        initial_directory="/storage/emulated/0/Download",
+                        file_type=ft.FilePickerFileType.CUSTOM,
+                        allowed_extensions=["pdf"],
+                        src_bytes=pdf_bytes,
+                    )
+                    if saved_uri:
+                        show_snackbar(
+                            f"گزارش PDF با نام «{filename}» با موفقیت ذخیره شد."
+                        )
+                    else:
+                        show_snackbar(
+                            f"ذخیره در Downloads لغو شد (نسخه پشتیبان در {backup_path.name} موجود است).",
+                            is_error=True,
+                        )
+                except Exception as picker_exc:
+                    logger.warning("SAF save_file error: %s", picker_exc)
+                    show_snackbar(
+                        f"گزارش در حافظه برنامه ذخیره شد: {backup_path}",
+                        is_error=False,
+                    )
+            except Exception as exc:
+                logger.exception("PDF report export failed")
+                show_snackbar(f"خطا در ساخت گزارش PDF: {exc}", is_error=True)
+            finally:
+                pdf_progress.visible = False
+                btn.disabled = False
+                try:
+                    btn.update()
+                except Exception:
+                    pass
+
         async def handle_retry_sync(_ev) -> None:
             page.pop_dialog()
             res = await api_client.retry_violation_sync(record)
@@ -722,42 +993,136 @@ async def main(page: ft.Page) -> None:
             )
             await reload_history_panel()
 
-        dialog_actions: list[ft.Control] = [
-            ft.TextButton(
-                "حذف",
-                style=ft.ButtonStyle(color=ft.Colors.RED_400),
-                on_click=handle_delete,
+        # تمامی دکمه‌های بخش جزئیات تخلف صراحتاً درون یک ردیف واحد (Single Row)
+        report_pdf_btn = ft.FilledButton(
+            tooltip="تولید گزارش PDF و ذخیره در پوشه دانلود",
+            content=ft.Row(
+                tight=True,
+                spacing=3,
+                alignment=ft.MainAxisAlignment.CENTER,
+                controls=[
+                    pdf_progress,
+                    ft.Icon(ft.Icons.PICTURE_AS_PDF, size=14),
+                    ft.Text("گزارش", size=11, weight=ft.FontWeight.BOLD),
+                ],
             ),
-        ]
+            style=ft.ButtonStyle(
+                bgcolor=ft.Colors.TEAL_700,
+                color=ft.Colors.WHITE,
+                shape=ft.RoundedRectangleBorder(radius=8),
+                padding=ft.Padding.symmetric(horizontal=6, vertical=9),
+            ),
+            expand=True,
+            on_click=handle_export_pdf,
+        )
+        pdf_btn_ref.append(report_pdf_btn)
+
+        single_row_buttons: list[ft.Control] = [report_pdf_btn]
+
         if not record.synced:
-            dialog_actions.append(
+            single_row_buttons.append(
                 ft.FilledButton(
-                    "ارسال مجدد به سرور",
-                    style=ft.ButtonStyle(bgcolor=ft.Colors.BLUE_700, color=ft.Colors.WHITE),
+                    tooltip="ارسال مجدد به سرور",
+                    content=ft.Row(
+                        tight=True,
+                        spacing=3,
+                        alignment=ft.MainAxisAlignment.CENTER,
+                        controls=[
+                            ft.Icon(ft.Icons.CLOUD_UPLOAD, size=14),
+                            ft.Text("ارسال", size=11, weight=ft.FontWeight.BOLD),
+                        ],
+                    ),
+                    style=ft.ButtonStyle(
+                        bgcolor=ft.Colors.BLUE_700,
+                        color=ft.Colors.WHITE,
+                        shape=ft.RoundedRectangleBorder(radius=8),
+                        padding=ft.Padding.symmetric(horizontal=6, vertical=9),
+                    ),
+                    expand=True,
                     on_click=handle_retry_sync,
                 )
             )
-        dialog_actions.append(
-            ft.FilledButton("بستن", on_click=lambda _: page.pop_dialog())
+
+        single_row_buttons.extend(
+            [
+                ft.FilledButton(
+                    tooltip="حذف گزارش تخلف",
+                    content=ft.Row(
+                        tight=True,
+                        spacing=3,
+                        alignment=ft.MainAxisAlignment.CENTER,
+                        controls=[
+                            ft.Icon(ft.Icons.DELETE_OUTLINE, size=14),
+                            ft.Text("حذف", size=11, weight=ft.FontWeight.BOLD),
+                        ],
+                    ),
+                    style=ft.ButtonStyle(
+                        bgcolor=ft.Colors.RED_700,
+                        color=ft.Colors.WHITE,
+                        shape=ft.RoundedRectangleBorder(radius=8),
+                        padding=ft.Padding.symmetric(horizontal=6, vertical=9),
+                    ),
+                    expand=True,
+                    on_click=handle_delete,
+                ),
+                ft.FilledButton(
+                    tooltip="بستن پنجره",
+                    content=ft.Row(
+                        tight=True,
+                        spacing=3,
+                        alignment=ft.MainAxisAlignment.CENTER,
+                        controls=[
+                            ft.Icon(ft.Icons.CLOSE, size=14),
+                            ft.Text("بستن", size=11, weight=ft.FontWeight.BOLD),
+                        ],
+                    ),
+                    style=ft.ButtonStyle(
+                        bgcolor=ft.Colors.BLUE_GREY_700,
+                        color=ft.Colors.WHITE,
+                        shape=ft.RoundedRectangleBorder(radius=8),
+                        padding=ft.Padding.symmetric(horizontal=6, vertical=9),
+                    ),
+                    expand=True,
+                    on_click=lambda _: page.pop_dialog(),
+                ),
+            ]
         )
 
+        # قرار دادن ردیف دکمه‌ها در پایین بدنه دیالوگ باعث می‌شود OverflowBar فلاتر
+        # هرگز آن‌ها را به دو ردیف عمودی نشکند و همیشه در یک ردیف افقی بمانند.
         page.show_dialog(
             ft.AlertDialog(
-                title=ft.Text("جزئیات تخلف ثبت‌شده"),
+                title=ft.Text("جزئیات تخلف ثبت‌شده", size=16, weight=ft.FontWeight.BOLD),
+                content_padding=ft.Padding.only(left=14, right=14, top=10, bottom=12),
                 content=ft.Container(
-                    width=340,
+                    width=350,
                     content=ft.Column(
                         tight=True,
-                        spacing=8,
-                        scroll=ft.ScrollMode.AUTO,
-                        controls=detail_controls,
+                        spacing=10,
+                        controls=[
+                            ft.Container(
+                                height=380,
+                                content=ft.Column(
+                                    spacing=8,
+                                    scroll=ft.ScrollMode.AUTO,
+                                    controls=detail_controls,
+                                ),
+                            ),
+                            ft.Divider(height=1, color=ft.Colors.BLUE_GREY_800),
+                            ft.Row(
+                                spacing=5,
+                                alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                                controls=single_row_buttons,
+                            ),
+                        ],
                     ),
                 ),
-                actions=dialog_actions,
+                actions=[],
             )
         )
 
     violation_panel = ViolationRegistrationPanel(
+        page=page,
         on_back=switch_to_info_view,
         on_submit=handle_violation_submit,
         on_capture_evidence=handle_capture_evidence_photo,
@@ -772,40 +1137,77 @@ async def main(page: ft.Page) -> None:
     register_violation_btn.on_click = switch_to_violation_view
     review_violations_btn.on_click = switch_to_history_view
 
-    bottom_section_container = ft.Container(
-        expand=4,
-        bgcolor="#0F141B",
-        border=ft.Border(top=ft.BorderSide(width=1, color=ft.Colors.BLUE_GREY_800)),
-        content=server_info_view,
-    )
-
     # -----------------------------------------------------------------------
-    # دیالوگ تنظیمات سریع سرور (آدرس API قابل تغییر در صورت نیاز)
+    # دیالوگ تنظیمات (آدرس سرور + دکمه رادیویی حالت استعلام خودکار، پیش‌فرض غیرفعال)
     # -----------------------------------------------------------------------
     def open_settings_dialog(_e=None) -> None:
         base_url_tf = ft.TextField(label="آدرس پایه سرور API", value=settings.api_base_url)
         check_path_tf = ft.TextField(label="مسیر استعلام پلاک", value=settings.api_check_path)
         viol_path_tf = ft.TextField(label="مسیر ثبت تخلف", value=settings.api_violation_path)
 
-        def save_settings(_ev) -> None:
+        auto_query_radio = ft.RadioGroup(
+            value="auto" if settings.auto_query_enabled else "manual",
+            content=ft.Column(
+                spacing=4,
+                controls=[
+                    ft.Radio(
+                        value="manual",
+                        label="غیرفعال — استعلام دستی با دکمه «استعلام پلاک» (پیش‌فرض)",
+                    ),
+                    ft.Radio(
+                        value="auto",
+                        label="فعال — استعلام خودکار بلافاصله پس از تشخیص پلاک",
+                    ),
+                ],
+            ),
+        )
+
+        def _save_settings_click(_ev) -> None:
             settings.api_base_url = (base_url_tf.value or "http://myweb.web.com").strip()
             settings.api_check_path = (check_path_tf.value or "/api/plate/check").strip()
             settings.api_violation_path = (viol_path_tf.value or "/api/violation").strip()
+            settings.auto_query_enabled = auto_query_radio.value == "auto"
+            save_settings(settings)
             api_client.clear_cache()
             page.pop_dialog()
-            show_snackbar("تنظیمات سرور ذخیره شد.")
+            render_server_info_panel()
+            bottom_section_container.update()
+            mode_msg = "فعال" if settings.auto_query_enabled else "غیرفعال (دستی)"
+            show_snackbar(f"تنظیمات ذخیره شد. استعلام خودکار: {mode_msg}")
 
         page.show_dialog(
             ft.AlertDialog(
-                title=ft.Text("تنظیمات اتصال به سرور"),
-                content=ft.Column(
-                    tight=True,
-                    spacing=10,
-                    controls=[base_url_tf, check_path_tf, viol_path_tf],
+                title=ft.Text("تنظیمات سامانه"),
+                content=ft.Container(
+                    width=340,
+                    content=ft.Column(
+                        tight=True,
+                        spacing=10,
+                        scroll=ft.ScrollMode.AUTO,
+                        controls=[
+                            ft.Text(
+                                "حالت استعلام پلاک از سرور:",
+                                size=13,
+                                weight=ft.FontWeight.BOLD,
+                                color=ft.Colors.LIGHT_BLUE_200,
+                            ),
+                            ft.Container(
+                                padding=ft.Padding.all(8),
+                                border_radius=ft.BorderRadius.all(10),
+                                bgcolor="#161B22",
+                                border=ft.Border.all(1, ft.Colors.BLUE_GREY_800),
+                                content=auto_query_radio,
+                            ),
+                            ft.Divider(height=6, color=ft.Colors.BLUE_GREY_800),
+                            base_url_tf,
+                            check_path_tf,
+                            viol_path_tf,
+                        ],
+                    ),
                 ),
                 actions=[
                     ft.TextButton("انصراف", on_click=lambda _: page.pop_dialog()),
-                    ft.FilledButton("ذخیره", on_click=save_settings),
+                    ft.FilledButton("ذخیره تنظیمات", on_click=_save_settings_click),
                 ],
             )
         )
@@ -813,7 +1215,7 @@ async def main(page: ft.Page) -> None:
     settings_btn.on_click = open_settings_dialog
 
     # -----------------------------------------------------------------------
-    # پایپ‌لاین استنتاج غیرهمزمان روی فریم‌های زنده دوربین
+    # پایپ‌لاین استنتاج غیرهمزمان و استعلام دستی/خودکار پلاک
     # -----------------------------------------------------------------------
     def _decode_and_infer_sync(frame_bytes: bytes, rotation_degrees: int) -> FrameInferenceResult:
         with Image.open(io.BytesIO(frame_bytes)) as img:
@@ -822,15 +1224,20 @@ async def main(page: ft.Page) -> None:
             rgb = rotate_pil_clockwise(rgb, rotation_degrees)
         return engine.process_image(rgb)
 
-    async def query_plate_server(plate: PlateDetection) -> None:
+    async def query_plate_server(
+        plate: PlateDetection,
+        *,
+        force_refresh: bool = False,
+    ) -> ApiCheckResult | None:
         plate_key = plate.plate_latin or plate.plate_persian
         if not plate_key:
-            return
+            return None
 
         result = await api_client.check_plate(
             plate_persian=plate.plate_persian,
             plate_latin=plate.plate_latin,
             confidence=plate.confidence,
+            force_refresh=force_refresh,
         )
         state.plate_statuses[plate_key] = result.status
 
@@ -838,11 +1245,52 @@ async def main(page: ft.Page) -> None:
             selected_key = state.selected_plate.plate_latin or state.selected_plate.plate_persian
             if selected_key == plate_key:
                 state.last_api_result = result
-                if state.bottom_mode == "info":
+                if state.screen_mode == "info":
                     render_server_info_panel()
                     bottom_section_container.update()
 
         refresh_overlay_boxes()
+        return result
+
+    async def handle_manual_query_click(_e=None) -> None:
+        """ارسال دستی پلاک شناسایی‌شده به سرور هنگام فشردن دکمه «استعلام پلاک»."""
+        if state.manual_query_busy:
+            return
+        plate = state.selected_plate
+        if plate is None or not (plate.plate_latin or plate.plate_persian):
+            show_snackbar(
+                "پلاکی شناسایی نشده است؛ ابتدا دوربین را به سمت پلاک خودرو بگیرید.",
+                is_error=True,
+            )
+            return
+
+        plate_key = plate.plate_latin or plate.plate_persian
+        state.manual_query_busy = True
+        state.plate_statuses[plate_key] = PlateCheckStatus.PENDING
+        state.last_api_result = None
+        query_plate_progress.visible = True
+        query_plate_btn.disabled = True
+        render_server_info_panel()
+        bottom_section_container.update()
+        refresh_overlay_boxes()
+
+        try:
+            res = await query_plate_server(plate, force_refresh=True)
+            if res is not None and res.error_message:
+                show_snackbar(res.error_message, is_error=True)
+            elif res is not None and res.status == PlateCheckStatus.REJECTED:
+                show_snackbar("نتیجه استعلام: غیرمجاز (NO)", is_error=True)
+            elif res is not None and res.status == PlateCheckStatus.APPROVED:
+                show_snackbar("نتیجه استعلام: مجاز (تأیید سرور)")
+        finally:
+            state.manual_query_busy = False
+            query_plate_progress.visible = False
+            query_plate_btn.disabled = False
+            if state.screen_mode == "info":
+                render_server_info_panel()
+                bottom_section_container.update()
+
+    query_plate_btn.on_click = handle_manual_query_click
 
     async def process_camera_frame(frame_bytes: bytes) -> None:
         try:
@@ -859,6 +1307,10 @@ async def main(page: ft.Page) -> None:
             state.last_raw_frame_bytes = frame_bytes
             state.last_raw_frame_rotation = rotation_deg
 
+            # در حالت صفحات تمام‌صفحه یا کادربندی عکس مستندات، فقط آخرین فریم ذخیره می‌شود
+            if state.screen_mode != "info":
+                return
+
             result = await asyncio.to_thread(_decode_and_infer_sync, frame_bytes, rotation_deg)
             state.last_inference_ms = result.inference_ms
             if result.inference_ms > 0:
@@ -868,13 +1320,12 @@ async def main(page: ft.Page) -> None:
 
             state.active_plates = result.plates
 
-            # ثبت رنگ آبی اولیه برای پلاک‌های جدید و ارسال غیرهمزمان پلاک کامل (۸ کاراکتر) به سرور
+            # ثبت رنگ آبی اولیه برای پلاک‌های جدید؛ استعلام خودکار فقط در صورت فعال بودن در تنظیمات
             for plate in result.plates:
                 plate_key = plate.plate_latin or plate.plate_persian
                 if not plate_key:
                     continue
 
-                # در حالت دومرحله‌ای تا تکمیل ۸ کاراکتر پلاک، کادر آبی می‌ماند تا استعلام ناقص به سرور ارسال نشود
                 if not engine.single_stage_mode and not plate.complete:
                     state.plate_statuses[plate_key] = PlateCheckStatus.PENDING
                     continue
@@ -883,9 +1334,9 @@ async def main(page: ft.Page) -> None:
                 if cached is not None:
                     state.plate_statuses[plate_key] = cached.status
                 elif plate_key not in state.plate_statuses:
-                    # بلافاصله پس از تشخیص محلی، رنگ کادر آبی می‌شود و سپس به سرور استعلام می‌رود
                     state.plate_statuses[plate_key] = PlateCheckStatus.PENDING
-                    asyncio.create_task(query_plate_server(plate))
+                    if settings.auto_query_enabled:
+                        asyncio.create_task(query_plate_server(plate))
 
             # انتخاب اصلی‌ترین پلاک دیده‌شده برای نمایش در بخش پایین صفحه
             if result.plates:
@@ -899,7 +1350,7 @@ async def main(page: ft.Page) -> None:
                 state.selected_plate = primary
                 if primary_key != prev_key:
                     state.last_api_result = api_client.get_cached(primary_key) if primary_key else None
-                if state.bottom_mode == "info":
+                if state.screen_mode == "info":
                     render_server_info_panel()
                     bottom_section_container.update()
 
@@ -914,7 +1365,6 @@ async def main(page: ft.Page) -> None:
             return
         now = time.monotonic()
         if state.inference_busy or (now - state.last_inference_ts) < settings.min_inference_interval_sec:
-            # حذف فریم‌های اضافی (Backpressure) جهت حفظ روانی ۶۰ فریم بر ثانیه دوربین
             return
         state.inference_busy = True
         state.last_inference_ts = now
@@ -976,12 +1426,13 @@ async def main(page: ft.Page) -> None:
         state.selected_plate = demo_plate
         state.plate_statuses[demo_plate.plate_latin] = PlateCheckStatus.PENDING
         state.last_api_result = None
-        if state.bottom_mode == "info":
+        if state.screen_mode == "info":
             render_server_info_panel()
             bottom_section_container.update()
         refresh_overlay_boxes()
 
-        # مکث کوتاه برای نمایش کادر آبی پیش از پاسخ سرور
+        # در حالت دستی، فقط پلاک شناسایی می‌شود و کادر آبی می‌ماند تا کاربر «استعلام پلاک» بزند؛
+        # ولی اگر دکمه شبیه‌سازی پاسخ زده شد، نتیجه آزمایشی نمایش داده می‌شود.
         await asyncio.sleep(0.7)
 
         state.plate_statuses[demo_plate.plate_latin] = (
@@ -1000,7 +1451,7 @@ async def main(page: ft.Page) -> None:
             latency_ms=42.0,
             checked_at=time.strftime("%H:%M:%S"),
         )
-        if state.bottom_mode == "info":
+        if state.screen_mode == "info":
             render_server_info_panel()
             bottom_section_container.update()
         refresh_overlay_boxes()
@@ -1022,14 +1473,13 @@ async def main(page: ft.Page) -> None:
         if not is_mobile_or_web:
             camera_placeholder_text.value = (
                 "حالت دسکتاپ: دوربین زنده Flet روی اندروید و iOS فعال است.\n"
-                "برای بررسی رنگ کادرها (آبی → قرمز/سبز)، ثبت تخلف و بازبینی تخلفات از دکمه‌های زیر استفاده کنید:"
+                "برای بررسی رنگ کادرها (آبی → قرمز/سبز)، ثبت تخلف و گزارش PDF از دکمه‌های زیر استفاده کنید:"
             )
             desktop_demo_controls.visible = True
             hud_status_text.value = "حالت پیش‌نمایش دسکتاپ"
             page.update()
             return
 
-        # درخواست مجوز زمان اجرای دوربین روی اندروید
         if page.platform in (ft.PagePlatform.ANDROID, ft.PagePlatform.IOS):
             try:
                 perm = await permission_handler.request(fph.Permission.CAMERA)
@@ -1053,7 +1503,6 @@ async def main(page: ft.Page) -> None:
                 page.update()
                 return
 
-            # انتخاب خودکار دوربین عقب گوشی
             back_cam = next(
                 (c for c in state.cameras if c.lens_direction == fc.CameraLensDirection.BACK),
                 state.cameras[0],
@@ -1093,10 +1542,8 @@ async def main(page: ft.Page) -> None:
     retry_camera_btn.on_click = init_camera_pipeline
 
     async def bootstrap_app() -> None:
-        # 1. بارگذاری شمارنده تخلفات ثبت‌شده قبلی
         await refresh_violation_counter(update_ui=False)
 
-        # 2. بارگذاری غیرهمزمان مدل‌های ONNX در ترد جداگانه تا رابط کاربری قفل نشود
         loaded = await asyncio.to_thread(engine.load)
         if loaded:
             mode_label = "تک‌مرحله‌ای" if engine.single_stage_mode else "دومرحله‌ای YOLO26"
@@ -1107,23 +1554,32 @@ async def main(page: ft.Page) -> None:
                 server_details_column.controls = [
                     ft.Text(engine.load_error, size=12, color=ft.Colors.AMBER_300)
                 ]
+        render_server_info_panel()
         page.update()
 
-        # 3. فعال‌سازی دوربین زنده گوشی
         await init_camera_pipeline()
 
     # -----------------------------------------------------------------------
-    # چیدمان نهایی صفحه اصلی (دو بخش بالا و پایین)
+    # چیدمان نهایی: لایه اصلی دوبخشی + لایه تمام‌صفحه ثبت/بازبینی تخلف + نوار عکاسی مستندات
     # -----------------------------------------------------------------------
+    main_split_view = ft.Column(
+        expand=True,
+        spacing=0,
+        controls=[
+            top_camera_section,
+            bottom_section_container,
+        ],
+    )
+
     page.add(
         ft.SafeArea(
             expand=True,
-            content=ft.Column(
+            content=ft.Stack(
                 expand=True,
-                spacing=0,
                 controls=[
-                    top_camera_section,
-                    bottom_section_container,
+                    main_split_view,
+                    fullscreen_overlay,
+                    evidence_capture_overlay,
                 ],
             ),
         )
