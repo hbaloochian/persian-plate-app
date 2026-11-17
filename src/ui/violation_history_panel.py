@@ -8,20 +8,24 @@ import flet as ft
 
 from config import to_persian_digits
 from services.api_client import ViolationRecord
+from ui.theme import get_theme_palette
 
 
 class ViolationHistoryPanel(ft.Container):
-    """صفحه تمام‌صفحه نمایش و بازبینی تخلفات ثبت‌شده."""
+    """صفحه تمام‌صفحه نمایش و بازبینی تخلفات ثبت‌شده با پشتیبانی از تم روز و شب."""
 
     def __init__(
         self,
         on_back: Callable[[], None],
         on_refresh: Callable[[], Awaitable[None]],
         on_select_record: Callable[[ViolationRecord], Awaitable[None]],
+        dark_mode: bool = True,
     ) -> None:
+        self._palette = get_theme_palette(dark_mode)
+        self._last_records: list[ViolationRecord] = []
         super().__init__(
             expand=True,
-            bgcolor="#0D1117",
+            bgcolor=self._palette.page_bg,
             padding=ft.Padding.all(14),
         )
         self._on_back = on_back
@@ -36,7 +40,7 @@ class ViolationHistoryPanel(ft.Container):
         self.count_badge = ft.Container(
             padding=ft.Padding.symmetric(horizontal=9, vertical=3),
             border_radius=ft.BorderRadius.all(12),
-            bgcolor=ft.Colors.BLUE_800,
+            bgcolor=self._palette.accent,
             content=ft.Text("۰", size=12, color=ft.Colors.WHITE, weight=ft.FontWeight.BOLD),
         )
 
@@ -65,9 +69,10 @@ class ViolationHistoryPanel(ft.Container):
             on_click=lambda _: self._on_back(),
         )
 
-        header_bar = ft.Container(
+        self._history_icon = ft.Icon(ft.Icons.HISTORY, color=self._palette.accent_text, size=24)
+        self._header_bar = ft.Container(
             padding=ft.Padding.only(bottom=10),
-            border=ft.Border.only(bottom=ft.BorderSide(1, ft.Colors.BLUE_GREY_800)),
+            border=ft.Border.only(bottom=ft.BorderSide(1, self._palette.border)),
             content=ft.Row(
                 alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
                 vertical_alignment=ft.CrossAxisAlignment.CENTER,
@@ -76,7 +81,7 @@ class ViolationHistoryPanel(ft.Container):
                         spacing=8,
                         vertical_alignment=ft.CrossAxisAlignment.CENTER,
                         controls=[
-                            ft.Icon(ft.Icons.HISTORY, color=ft.Colors.LIGHT_BLUE_300, size=24),
+                            self._history_icon,
                             self.title_text,
                             self.count_badge,
                         ],
@@ -100,9 +105,9 @@ class ViolationHistoryPanel(ft.Container):
             ),
         )
 
-        footer_bar = ft.Container(
+        self._footer_bar = ft.Container(
             padding=ft.Padding.only(top=10),
-            border=ft.Border.only(top=ft.BorderSide(1, ft.Colors.BLUE_GREY_800)),
+            border=ft.Border.only(top=ft.BorderSide(1, self._palette.border)),
             content=self.back_button,
         )
 
@@ -110,20 +115,31 @@ class ViolationHistoryPanel(ft.Container):
             spacing=12,
             expand=True,
             controls=[
-                header_bar,
+                self._header_bar,
                 ft.Container(
                     expand=True,
                     content=self.records_column,
                 ),
-                footer_bar,
+                self._footer_bar,
             ],
         )
+
+    def apply_theme(self, dark_mode: bool) -> None:
+        """رنگ‌های صفحه بازبینی تخلفات و کارت‌ها را با تم شب یا روز هماهنگ می‌کند."""
+        self._palette = get_theme_palette(dark_mode)
+        self.bgcolor = self._palette.page_bg
+        self._history_icon.color = self._palette.accent_text
+        self._header_bar.border = ft.Border.only(bottom=ft.BorderSide(1, self._palette.border))
+        self._footer_bar.border = ft.Border.only(top=ft.BorderSide(1, self._palette.border))
+        self.set_records(self._last_records)
 
     async def _handle_refresh(self, _e=None) -> None:
         await self._on_refresh()
 
     def set_records(self, records: list[ViolationRecord]) -> None:
         """فهرست کارت‌های تخلفات ثبت‌شده را بروزرسانی می‌کند."""
+        self._last_records = list(records)
+        p = self._palette
         self.count_badge.content = ft.Text(
             to_persian_digits(str(len(records))),
             size=11,
@@ -144,18 +160,18 @@ class ViolationHistoryPanel(ft.Container):
                             ft.Icon(
                                 ft.Icons.INVENTORY_2_OUTLINED,
                                 size=38,
-                                color=ft.Colors.BLUE_GREY_400,
+                                color=p.text_muted,
                             ),
                             ft.Text(
                                 "هنوز هیچ تخلفی ثبت نشده است.",
                                 size=13,
-                                color=ft.Colors.WHITE_70,
+                                color=p.text_secondary,
                                 weight=ft.FontWeight.W_500,
                             ),
                             ft.Text(
                                 "پس از ثبت تخلف، گزارش‌ها به همراه تصاویر پلاک و مستندات اینجا نمایش داده می‌شوند.",
                                 size=11,
-                                color=ft.Colors.WHITE_60,
+                                color=p.text_muted,
                                 text_align=ft.TextAlign.CENTER,
                             ),
                         ],
@@ -170,6 +186,7 @@ class ViolationHistoryPanel(ft.Container):
         self.records_column.controls = cards
 
     def _build_record_card(self, rec: ViolationRecord) -> ft.Container:
+        p = self._palette
         sync_label = "ارسال‌شده به سرور" if rec.synced else "ذخیره محلی"
         sync_color = ft.Colors.GREEN_700 if rec.synced else ft.Colors.ORANGE_800
         sync_icon = ft.Icons.CLOUD_DONE if rec.synced else ft.Icons.CLOUD_OFF
@@ -180,13 +197,13 @@ class ViolationHistoryPanel(ft.Container):
                 ft.Container(
                     padding=ft.Padding.symmetric(horizontal=6, vertical=2),
                     border_radius=ft.BorderRadius.all(6),
-                    bgcolor=ft.Colors.BLUE_GREY_800,
+                    bgcolor=p.plate_chip_bg,
                     content=ft.Row(
                         tight=True,
                         spacing=4,
                         controls=[
-                            ft.Icon(ft.Icons.CROP_ORIGINAL, size=12, color=ft.Colors.LIGHT_BLUE_200),
-                            ft.Text("تصویر پلاک", size=10, color=ft.Colors.WHITE_70),
+                            ft.Icon(ft.Icons.CROP_ORIGINAL, size=12, color=p.accent_text),
+                            ft.Text("تصویر پلاک", size=10, color=p.chip_text),
                         ],
                     ),
                 )
@@ -196,13 +213,17 @@ class ViolationHistoryPanel(ft.Container):
                 ft.Container(
                     padding=ft.Padding.symmetric(horizontal=6, vertical=2),
                     border_radius=ft.BorderRadius.all(6),
-                    bgcolor=ft.Colors.TEAL_900,
+                    bgcolor=p.evidence_chip_bg,
                     content=ft.Row(
                         tight=True,
                         spacing=4,
                         controls=[
-                            ft.Icon(ft.Icons.IMAGE, size=12, color=ft.Colors.TEAL_200),
-                            ft.Text("عکس مستندات", size=10, color=ft.Colors.WHITE_70),
+                            ft.Icon(
+                                ft.Icons.IMAGE,
+                                size=12,
+                                color=ft.Colors.TEAL_200 if p.dark_mode else ft.Colors.TEAL_800,
+                            ),
+                            ft.Text("عکس مستندات", size=10, color=p.chip_text),
                         ],
                     ),
                 )
@@ -216,12 +237,12 @@ class ViolationHistoryPanel(ft.Container):
                     ft.Row(
                         spacing=6,
                         controls=[
-                            ft.Icon(ft.Icons.DIRECTIONS_CAR, size=16, color=ft.Colors.LIGHT_BLUE_300),
+                            ft.Icon(ft.Icons.DIRECTIONS_CAR, size=16, color=p.accent_text),
                             ft.Text(
                                 rec.plate,
                                 size=14,
                                 weight=ft.FontWeight.BOLD,
-                                color=ft.Colors.WHITE,
+                                color=p.text_primary,
                             ),
                         ],
                     ),
@@ -234,7 +255,12 @@ class ViolationHistoryPanel(ft.Container):
                             spacing=4,
                             controls=[
                                 ft.Icon(sync_icon, size=12, color=ft.Colors.WHITE),
-                                ft.Text(sync_label, size=10, color=ft.Colors.WHITE, weight=ft.FontWeight.BOLD),
+                                ft.Text(
+                                    sync_label,
+                                    size=10,
+                                    color=ft.Colors.WHITE,
+                                    weight=ft.FontWeight.BOLD,
+                                ),
                             ],
                         ),
                     ),
@@ -247,18 +273,18 @@ class ViolationHistoryPanel(ft.Container):
                     ft.Text(
                         rec.violation_type,
                         size=13,
-                        color=ft.Colors.AMBER_300,
+                        color=p.violation_text,
                         weight=ft.FontWeight.W_600,
                     ),
                     ft.Row(
                         tight=True,
                         spacing=4,
                         controls=[
-                            ft.Icon(ft.Icons.CALENDAR_TODAY, size=12, color=ft.Colors.LIGHT_BLUE_200),
+                            ft.Icon(ft.Icons.CALENDAR_TODAY, size=12, color=p.accent_text),
                             ft.Text(
                                 rec.display_jalali_datetime or "---",
                                 size=11,
-                                color=ft.Colors.WHITE_70,
+                                color=p.text_secondary,
                             ),
                         ],
                     ),
@@ -268,9 +294,7 @@ class ViolationHistoryPanel(ft.Container):
 
         if rec.description:
             snippet = rec.description if len(rec.description) <= 75 else f"{rec.description[:72]}..."
-            body_controls.append(
-                ft.Text(snippet, size=11, color=ft.Colors.WHITE_70)
-            )
+            body_controls.append(ft.Text(snippet, size=11, color=p.text_secondary))
 
         footer_row = ft.Row(
             alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
@@ -281,8 +305,8 @@ class ViolationHistoryPanel(ft.Container):
                     tight=True,
                     spacing=2,
                     controls=[
-                        ft.Text("مشاهده جزئیات", size=11, color=ft.Colors.LIGHT_BLUE_300),
-                        ft.Icon(ft.Icons.CHEVRON_LEFT, size=16, color=ft.Colors.LIGHT_BLUE_300),
+                        ft.Text("مشاهده جزئیات", size=11, color=p.accent_text),
+                        ft.Icon(ft.Icons.CHEVRON_LEFT, size=16, color=p.accent_text),
                     ],
                 ),
             ],
@@ -295,8 +319,8 @@ class ViolationHistoryPanel(ft.Container):
         return ft.Container(
             padding=ft.Padding.all(10),
             border_radius=ft.BorderRadius.all(10),
-            bgcolor="#161B22",
-            border=ft.Border.all(1, ft.Colors.BLUE_GREY_800),
+            bgcolor=p.card_bg,
+            border=ft.Border.all(1, p.border),
             ink=True,
             on_click=_on_card_click,
             content=ft.Column(spacing=5, controls=body_controls),

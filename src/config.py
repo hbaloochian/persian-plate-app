@@ -116,6 +116,12 @@ class AppSettings:
     # حالت استعلام خودکار از سرور: به‌صورت پیش‌فرض غیرفعال است و فقط با فعال‌سازی کاربر انجام می‌شود
     auto_query_enabled: bool = False
 
+    # نوع استعلام پلاک: به‌صورت پیش‌فرض غیرفعال (فقط پلاک‌های عمومی حرف «ع» استعلام می‌شوند)
+    query_all_plates: bool = False
+
+    # تم ظاهری برنامه: True = تم شب (تیره)، False = تم روز (روشن)
+    dark_mode: bool = True
+
     # پارامترهای مدل هوش مصنوعی (قابل تنظیم برای توازن سرعت/دقت)
     input_size: int = 640
     cars_conf_threshold: float = 0.55
@@ -168,6 +174,10 @@ def load_settings(data_dir: Path | None = None) -> AppSettings:
             settings.api_violation_path = data["api_violation_path"].strip()
         if isinstance(data.get("auto_query_enabled"), bool):
             settings.auto_query_enabled = data["auto_query_enabled"]
+        if isinstance(data.get("query_all_plates"), bool):
+            settings.query_all_plates = data["query_all_plates"]
+        if isinstance(data.get("dark_mode"), bool):
+            settings.dark_mode = data["dark_mode"]
     except (OSError, ValueError):
         pass
     return settings
@@ -181,8 +191,45 @@ def save_settings(settings: AppSettings, data_dir: Path | None = None) -> None:
         "api_check_path": settings.api_check_path,
         "api_violation_path": settings.api_violation_path,
         "auto_query_enabled": bool(settings.auto_query_enabled),
+        "query_all_plates": bool(settings.query_all_plates),
+        "dark_mode": bool(settings.dark_mode),
     }
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def is_public_ein_plate(
+    chars_persian: list[str] | None = None,
+    plate_persian: str = "",
+    plate_latin: str = "",
+) -> bool:
+    """بررسی می‌کند آیا پلاک جزو پلاک‌های حمل‌ونقل عمومی (دارای حرف «ع») است یا خیر."""
+    if chars_persian:
+        if len(chars_persian) == 8:
+            return chars_persian[2].strip() == "ع"
+        if any(ch.strip() == "ع" for ch in chars_persian):
+            return True
+
+    if "ع" in (plate_persian or ""):
+        return True
+    if "EIN" in (plate_latin or "").upper():
+        return True
+    return False
+
+
+def should_query_plate(
+    settings: AppSettings,
+    chars_persian: list[str] | None = None,
+    plate_persian: str = "",
+    plate_latin: str = "",
+) -> bool:
+    """بر اساس سوییچ «استعلام تمام پلاکها» تعیین می‌کند آیا پلاک مجاز به استعلام از سرور است."""
+    if settings.query_all_plates:
+        return True
+    return is_public_ein_plate(
+        chars_persian=chars_persian,
+        plate_persian=plate_persian,
+        plate_latin=plate_latin,
+    )
 
 
 def to_persian_digits(text: str) -> str:

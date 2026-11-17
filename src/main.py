@@ -30,7 +30,7 @@ SRC_DIR = Path(__file__).resolve().parent
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from config import load_settings, save_settings, to_persian_digits
+from config import load_settings, save_settings, should_query_plate, to_persian_digits
 from core.geometry import compute_android_rotation_degrees, rotate_pil_clockwise
 from core.plate_detector import FrameInferenceResult, PersianPlateEngine, PlateDetection
 from services.api_client import (
@@ -53,6 +53,8 @@ from ui.components import (
     build_overlay_shapes,
     status_to_badge_info,
 )
+from ui.login_screen import LoginScreen
+from ui.theme import BRAND_BLUE, get_theme_palette
 from ui.violation_history_panel import ViolationHistoryPanel
 from ui.violation_panel import ViolationRegistrationPanel
 
@@ -97,6 +99,9 @@ class AppRuntimeState:
 
     # حالت فعلی نمایش برنامه: "info" | "violation" | "history" | "evidence_camera"
     screen_mode: str = "info"
+    is_authenticated: bool = False
+    current_username: str = ""
+    camera_started: bool = False
     manual_query_busy: bool = False
     evidence_capture_future: asyncio.Future[bytes | None] | None = None
 
@@ -138,16 +143,18 @@ def _create_demo_jpeg(color: tuple[int, int, int], size: tuple[int, int] = (320,
 
 
 async def main(page: ft.Page) -> None:
+    # بارگذاری تنظیمات ذخیره‌شده (استعلام خودکار و استعلام تمام پلاکها پیش‌فرض غیرفعال هستند)
+    settings = load_settings()
+    palette = get_theme_palette(settings.dark_mode)
+
     page.title = "پلاک‌خوان هوشمند"
     page.rtl = True
-    page.theme_mode = ft.ThemeMode.DARK
+    page.theme_mode = ft.ThemeMode.DARK if settings.dark_mode else ft.ThemeMode.LIGHT
     page.padding = 0
     page.spacing = 0
-    page.bgcolor = ft.Colors.GREY_950 if hasattr(ft.Colors, "GREY_950") else "#0D1117"
-    page.theme = ft.Theme(color_scheme_seed=ft.Colors.BLUE)
+    page.bgcolor = palette.page_bg
+    page.theme = ft.Theme(color_scheme_seed=BRAND_BLUE)
 
-    # بارگذاری تنظیمات ذخیره‌شده (حالت استعلام خودکار به‌صورت پیش‌فرض غیرفعال است)
-    settings = load_settings()
     state = AppRuntimeState()
     engine = PersianPlateEngine(settings=settings)
     api_client = PlateApiClient(settings=settings)
@@ -324,24 +331,23 @@ async def main(page: ft.Page) -> None:
         ),
     )
 
+    initial_guide_text = ft.Text(
+        "دوربین گوشی را به سمت پلاک خودرو بگیرید. پس از تشخیص محلی (کادر آبی)، "
+        "برای استعلام از سرور دکمه «استعلام پلاک» را بزنید یا حالت استعلام خودکار را از تنظیمات فعال کنید.",
+        size=12,
+        color=palette.text_secondary,
+    )
     server_details_column = ft.Column(
         spacing=5,
-        controls=[
-            ft.Text(
-                "دوربین گوشی را به سمت پلاک خودرو بگیرید. پس از تشخیص محلی (کادر آبی)، "
-                "برای استعلام از سرور دکمه «استعلام پلاک» را بزنید یا حالت استعلام خودکار را از تنظیمات فعال کنید.",
-                size=12,
-                color=ft.Colors.WHITE_70,
-            )
-        ],
+        controls=[initial_guide_text],
     )
 
     server_info_card = ft.Container(
         expand=True,
         padding=ft.Padding.all(10),
         border_radius=ft.BorderRadius.all(10),
-        bgcolor="#161B22",
-        border=ft.Border.all(1, ft.Colors.BLUE_GREY_800),
+        bgcolor=palette.card_bg,
+        border=ft.Border.all(1, palette.border),
         content=ft.Column(
             scroll=ft.ScrollMode.AUTO,
             expand=True,
@@ -431,8 +437,8 @@ async def main(page: ft.Page) -> None:
 
     bottom_section_container = ft.Container(
         expand=4,
-        bgcolor="#0F141B",
-        border=ft.Border(top=ft.BorderSide(width=1, color=ft.Colors.BLUE_GREY_800)),
+        bgcolor=palette.panel_bg,
+        border=ft.Border(top=ft.BorderSide(width=1, color=palette.border)),
         content=server_info_view,
     )
 
@@ -440,7 +446,7 @@ async def main(page: ft.Page) -> None:
     # (دوربین زنده در لایه زیرین فعال می‌ماند تا بازگشت فوری و عکس‌برداری مستندات بی‌وقفه باشد)
     fullscreen_overlay = ft.Container(
         expand=True,
-        bgcolor="#0D1117",
+        bgcolor=palette.page_bg,
         visible=False,
     )
 
@@ -471,13 +477,19 @@ async def main(page: ft.Page) -> None:
             padding=ft.Padding.symmetric(horizontal=16, vertical=14),
         ),
     )
+    evidence_prompt_text = ft.Text(
+        "دوربین را به سمت خودرو یا صحنه تخلف بگیرید و دکمه ثبت عکس را بزنید.",
+        size=13,
+        color=palette.text_primary,
+        expand=True,
+    )
     evidence_capture_overlay = ft.Container(
         left=0,
         right=0,
         bottom=0,
         padding=ft.Padding.all(14),
-        bgcolor=ft.Colors.with_opacity(0.92, "#0F141B"),
-        border=ft.Border(top=ft.BorderSide(1, ft.Colors.BLUE_GREY_700)),
+        bgcolor=palette.overlay_scrim,
+        border=ft.Border(top=ft.BorderSide(1, palette.border)),
         visible=False,
         content=ft.Column(
             tight=True,
@@ -487,13 +499,8 @@ async def main(page: ft.Page) -> None:
                     spacing=8,
                     vertical_alignment=ft.CrossAxisAlignment.CENTER,
                     controls=[
-                        ft.Icon(ft.Icons.ADD_A_PHOTO, color=ft.Colors.GREEN_400, size=20),
-                        ft.Text(
-                            "دوربین را به سمت خودرو یا صحنه تخلف بگیرید و دکمه ثبت عکس را بزنید.",
-                            size=13,
-                            color=ft.Colors.WHITE,
-                            expand=True,
-                        ),
+                        ft.Icon(ft.Icons.ADD_A_PHOTO, color=ft.Colors.GREEN_500, size=20),
+                        evidence_prompt_text,
                     ],
                 ),
                 ft.Row(
@@ -544,16 +551,21 @@ async def main(page: ft.Page) -> None:
         )
         overlay_canvas.update()
 
-    def _info_row(label: str, value: str, value_color: str = ft.Colors.WHITE) -> ft.Row:
+    def _info_row(
+        label: str,
+        value: str,
+        value_color: str | None = None,
+    ) -> ft.Row:
+        p = get_theme_palette(settings.dark_mode)
         return ft.Row(
             alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
             vertical_alignment=ft.CrossAxisAlignment.START,
             controls=[
-                ft.Text(f"{label}:", size=12, color=ft.Colors.WHITE_60),
+                ft.Text(f"{label}:", size=12, color=p.text_muted),
                 ft.Text(
                     value,
                     size=12,
-                    color=value_color,
+                    color=value_color or p.text_primary,
                     weight=ft.FontWeight.W_600,
                     text_align=ft.TextAlign.LEFT,
                     expand=True,
@@ -562,25 +574,40 @@ async def main(page: ft.Page) -> None:
         )
 
     def render_server_info_panel() -> None:
+        p = get_theme_palette(settings.dark_mode)
         plate = state.selected_plate
         api_res = state.last_api_result
 
         if plate is None:
             plate_widget_holder.content = build_iranian_plate_widget([], PlateCheckStatus.PENDING)
-            status_chip.bgcolor = ft.Colors.BLUE_GREY_800
+            status_chip.bgcolor = ft.Colors.BLUE_GREY_700 if p.dark_mode else BRAND_BLUE
             status_chip_icon.name = ft.Icons.SEARCH
             mode_note = "خودکار" if settings.auto_query_enabled else "دستی"
-            status_chip_label.value = f"در انتظار تشخیص پلاک (استعلام {mode_note})"
+            scope_note = "همه پلاک‌ها" if settings.query_all_plates else "فقط پلاک‌های «ع»"
+            status_chip_label.value = f"در انتظار تشخیص پلاک ({mode_note} | {scope_note})"
+            initial_guide_text.color = p.text_secondary
             return
 
         plate_key = plate.plate_latin or plate.plate_persian
         current_status = state.plate_statuses.get(plate_key, PlateCheckStatus.PENDING)
         plate_widget_holder.content = build_iranian_plate_widget(plate.chars_persian, current_status)
 
+        plate_allowed_for_query = should_query_plate(
+            settings,
+            chars_persian=plate.chars_persian,
+            plate_persian=plate.plate_persian,
+            plate_latin=plate.plate_latin,
+        )
+
         title, bg_color, icon_name = status_to_badge_info(
             current_status,
-            auto_query_enabled=settings.auto_query_enabled or state.manual_query_busy,
+            auto_query_enabled=(
+                (settings.auto_query_enabled and plate_allowed_for_query)
+                or state.manual_query_busy
+            ),
         )
+        if current_status == PlateCheckStatus.PENDING and not plate_allowed_for_query:
+            title = "پلاک شناسایی شد (فقط پلاک‌های «ع» استعلام می‌شوند)"
         status_chip.bgcolor = bg_color
         status_chip_icon.name = icon_name
         status_chip_label.value = title
@@ -592,14 +619,25 @@ async def main(page: ft.Page) -> None:
             _info_row(
                 "حالت استعلام",
                 "خودکار" if settings.auto_query_enabled else "دستی (با دکمه استعلام پلاک)",
-                value_color=ft.Colors.LIGHT_BLUE_200,
+                value_color=p.accent_text,
+            ),
+            _info_row(
+                "نوع پلاک مجاز استعلام",
+                "تمام پلاک‌ها" if settings.query_all_plates else "فقط پلاک‌های عمومی (ع)",
+                value_color=p.accent_text,
             ),
         ]
 
         if api_res is not None:
-            rows.append(ft.Divider(height=8, color=ft.Colors.BLUE_GREY_800))
+            rows.append(ft.Divider(height=8, color=p.border))
             if api_res.error_message:
-                rows.append(_info_row("وضعیت ارتباط", api_res.error_message, value_color=ft.Colors.ORANGE_300))
+                rows.append(
+                    _info_row(
+                        "وضعیت ارتباط",
+                        api_res.error_message,
+                        value_color=ft.Colors.ORANGE_400 if p.dark_mode else ft.Colors.ORANGE_800,
+                    )
+                )
             else:
                 rows.append(_info_row("زمان استعلام", to_persian_digits(api_res.checked_at)))
                 rows.append(_info_row("سرعت پاسخ سرور", to_persian_digits(f"{int(api_res.latency_ms)} میلی‌ثانیه")))
@@ -608,6 +646,14 @@ async def main(page: ft.Page) -> None:
         else:
             if not engine.single_stage_mode and not plate.complete:
                 rows.append(_info_row("وضعیت", "در حال خوانش کامل ۸ کاراکتر پلاک (کادر آبی)..."))
+            elif not plate_allowed_for_query:
+                rows.append(
+                    _info_row(
+                        "وضعیت فیلتر",
+                        "این پلاک حرف «ع» ندارد و ارسال نمی‌شود (برای استعلام همه، سوییچ «استعلام تمام پلاکها» را در تنظیمات فعال کنید).",
+                        value_color=p.violation_text,
+                    )
+                )
             elif settings.auto_query_enabled or state.manual_query_busy:
                 rows.append(_info_row("آدرس API", settings.check_url))
                 rows.append(_info_row("وضعیت", "در حال ارسال پلاک به سرور..."))
@@ -616,7 +662,7 @@ async def main(page: ft.Page) -> None:
                     _info_row(
                         "راهنما",
                         "برای ارسال به سرور، دکمه «استعلام پلاک» را فشار دهید.",
-                        value_color=ft.Colors.LIGHT_BLUE_200,
+                        value_color=p.accent_text,
                     )
                 )
 
@@ -841,16 +887,20 @@ async def main(page: ft.Page) -> None:
             jalali_date_str = f"{record.jalali_weekday} ({jalali_date_str})"
         jalali_time_str = to_persian_digits(record.jalali_time or "---")
 
+        p = get_theme_palette(settings.dark_mode)
+        synced_color = ft.Colors.GREEN_400 if p.dark_mode else ft.Colors.GREEN_700
+        unsynced_color = ft.Colors.ORANGE_300 if p.dark_mode else ft.Colors.ORANGE_800
+
         detail_controls: list[ft.Control] = [
             _info_row("پلاک خودرو", to_persian_digits(record.plate)),
             _info_row("کد لاتین پلاک", record.plate_latin or "---"),
-            _info_row("نوع تخلف", record.violation_type, value_color=ft.Colors.AMBER_300),
-            _info_row("تاریخ شمسی", jalali_date_str, value_color=ft.Colors.LIGHT_BLUE_200),
-            _info_row("ساعت ثبت", jalali_time_str, value_color=ft.Colors.LIGHT_BLUE_200),
+            _info_row("نوع تخلف", record.violation_type, value_color=p.violation_text),
+            _info_row("تاریخ شمسی", jalali_date_str, value_color=p.accent_text),
+            _info_row("ساعت ثبت", jalali_time_str, value_color=p.accent_text),
             _info_row(
                 "وضعیت ارسال",
                 "ارسال‌شده به سرور" if record.synced else "ذخیره‌شده روی گوشی (ارسال‌نشده)",
-                value_color=ft.Colors.GREEN_400 if record.synced else ft.Colors.ORANGE_300,
+                value_color=synced_color if record.synced else unsynced_color,
             ),
         ]
         if record.description:
@@ -861,7 +911,7 @@ async def main(page: ft.Page) -> None:
         if plate_bytes:
             detail_controls.extend(
                 [
-                    ft.Divider(height=10, color=ft.Colors.BLUE_GREY_800),
+                    ft.Divider(height=10, color=p.border),
                     ft.Text("تصویر برش‌خورده پلاک:", size=12, weight=ft.FontWeight.BOLD),
                     ft.Container(
                         alignment=ft.Alignment.CENTER,
@@ -881,7 +931,7 @@ async def main(page: ft.Page) -> None:
         if evidence_bytes:
             detail_controls.extend(
                 [
-                    ft.Divider(height=10, color=ft.Colors.BLUE_GREY_800),
+                    ft.Divider(height=10, color=p.border),
                     ft.Text("تصویر مستندات تخلف:", size=12, weight=ft.FontWeight.BOLD),
                     ft.Container(
                         alignment=ft.Alignment.CENTER,
@@ -903,7 +953,7 @@ async def main(page: ft.Page) -> None:
                 ft.Text(
                     "تصویری برای این تخلف پیوست نشده است.",
                     size=11,
-                    color=ft.Colors.WHITE_60,
+                    color=p.text_muted,
                 )
             )
 
@@ -1127,57 +1177,164 @@ async def main(page: ft.Page) -> None:
         on_submit=handle_violation_submit,
         on_capture_evidence=handle_capture_evidence_photo,
         on_pick_evidence=handle_pick_evidence_photo,
+        dark_mode=settings.dark_mode,
     )
     violation_history_panel = ViolationHistoryPanel(
         on_back=switch_to_info_view,
         on_refresh=reload_history_panel,
         on_select_record=open_violation_detail_dialog,
+        dark_mode=settings.dark_mode,
     )
 
     register_violation_btn.on_click = switch_to_violation_view
     review_violations_btn.on_click = switch_to_history_view
 
     # -----------------------------------------------------------------------
-    # دیالوگ تنظیمات (آدرس سرور + کلید ft.Switch برای حالت استعلام خودکار، پیش‌فرض غیرفعال)
+    # اعمال پویای تم روز (روشن) و تم شب (تیره) روی کل اپلیکیشن
+    # -----------------------------------------------------------------------
+    login_screen_ref: list[LoginScreen] = []
+
+    def apply_app_theme(dark_mode: bool, *, update_page: bool = True) -> None:
+        settings.dark_mode = bool(dark_mode)
+        p = get_theme_palette(settings.dark_mode)
+        page.theme_mode = ft.ThemeMode.DARK if settings.dark_mode else ft.ThemeMode.LIGHT
+        page.bgcolor = p.page_bg
+
+        bottom_section_container.bgcolor = p.panel_bg
+        bottom_section_container.border = ft.Border(top=ft.BorderSide(width=1, color=p.border))
+        server_info_card.bgcolor = p.card_bg
+        server_info_card.border = ft.Border.all(1, p.border)
+        fullscreen_overlay.bgcolor = p.page_bg
+        evidence_capture_overlay.bgcolor = p.overlay_scrim
+        evidence_capture_overlay.border = ft.Border(top=ft.BorderSide(1, p.border))
+        evidence_prompt_text.color = p.text_primary
+        initial_guide_text.color = p.text_secondary
+
+        violation_panel.apply_theme(settings.dark_mode)
+        violation_history_panel.apply_theme(settings.dark_mode)
+        if login_screen_ref:
+            login_screen_ref[0].apply_theme(settings.dark_mode)
+
+        render_server_info_panel()
+        if update_page:
+            page.update()
+
+    # -----------------------------------------------------------------------
+    # دیالوگ تنظیمات (سوییچ استعلام خودکار + سوییچ استعلام تمام پلاکها + سوییچ تم روز/شب + آدرس سرور)
     # -----------------------------------------------------------------------
     def open_settings_dialog(_e=None) -> None:
+        prev_dark_mode = settings.dark_mode
+        p = get_theme_palette(settings.dark_mode)
+
         base_url_tf = ft.TextField(label="آدرس پایه سرور API", value=settings.api_base_url)
         check_path_tf = ft.TextField(label="مسیر استعلام پلاک", value=settings.api_check_path)
         viol_path_tf = ft.TextField(label="مسیر ثبت تخلف", value=settings.api_violation_path)
 
         def _auto_query_hint(enabled: bool) -> str:
             if enabled:
-                return "فعال: بلافاصله پس از تشخیص پلاک، استعلام به‌صورت خودکار از سرور انجام می‌شود."
-            return "غیرفعال (پیش‌فرض): استعلام فقط هنگام فشردن دکمه «استعلام پلاک» انجام می‌شود."
+                return "فعال: بلافاصله پس از تشخیص پلاک، استعلام به‌صورت خودکار انجام می‌شود."
+            return "غیرفعال (پیش‌فرض): استعلام فقط با فشردن دکمه «استعلام پلاک» انجام می‌شود."
+
+        def _all_plates_hint(enabled: bool) -> str:
+            if enabled:
+                return "فعال: تمامی پلاک‌های خودرو برای استعلام به سرور ارسال می‌شوند."
+            return "غیرفعال (پیش‌فرض): فقط پلاک‌های عمومی دارای حرف «ع» برای استعلام ارسال می‌شوند."
+
+        def _theme_hint(is_dark: bool) -> str:
+            return "حالت فعلی: تم شب (تیره)" if is_dark else "حالت فعلی: تم روز (روشن)"
 
         auto_query_hint_text = ft.Text(
             _auto_query_hint(settings.auto_query_enabled),
             size=11,
-            color=ft.Colors.WHITE_70,
+            color=p.text_secondary,
+        )
+        all_plates_hint_text = ft.Text(
+            _all_plates_hint(settings.query_all_plates),
+            size=11,
+            color=p.text_secondary,
+        )
+        theme_hint_text = ft.Text(
+            _theme_hint(settings.dark_mode),
+            size=11,
+            color=p.text_secondary,
+        )
+
+        switches_card = ft.Container(
+            padding=ft.Padding.all(10),
+            border_radius=ft.BorderRadius.all(10),
+            bgcolor=p.card_bg,
+            border=ft.Border.all(1, p.border),
         )
 
         def _on_auto_query_toggle(ev: ft.ControlEvent) -> None:
             auto_query_hint_text.value = _auto_query_hint(bool(ev.control.value))
             auto_query_hint_text.update()
 
+        def _on_all_plates_toggle(ev: ft.ControlEvent) -> None:
+            all_plates_hint_text.value = _all_plates_hint(bool(ev.control.value))
+            all_plates_hint_text.update()
+
+        def _on_theme_toggle(ev: ft.ControlEvent) -> None:
+            is_dark = bool(ev.control.value)
+            new_p = get_theme_palette(is_dark)
+            theme_hint_text.value = _theme_hint(is_dark)
+            auto_query_hint_text.color = new_p.text_secondary
+            all_plates_hint_text.color = new_p.text_secondary
+            theme_hint_text.color = new_p.text_secondary
+            switches_card.bgcolor = new_p.card_bg
+            switches_card.border = ft.Border.all(1, new_p.border)
+            apply_app_theme(is_dark, update_page=True)
+
         auto_query_switch = ft.Switch(
             label="استعلام خودکار",
             value=settings.auto_query_enabled,
             on_change=_on_auto_query_toggle,
         )
+        all_plates_switch = ft.Switch(
+            label="استعلام تمام پلاکها",
+            value=settings.query_all_plates,
+            on_change=_on_all_plates_toggle,
+        )
+        theme_switch = ft.Switch(
+            label="تم شب / روز (فعال = شب)",
+            value=settings.dark_mode,
+            on_change=_on_theme_toggle,
+        )
+
+        switches_card.content = ft.Column(
+            spacing=6,
+            controls=[
+                auto_query_switch,
+                auto_query_hint_text,
+                ft.Divider(height=6, color=p.border),
+                all_plates_switch,
+                all_plates_hint_text,
+                ft.Divider(height=6, color=p.border),
+                theme_switch,
+                theme_hint_text,
+            ],
+        )
+
+        def _cancel_settings_click(_ev) -> None:
+            if settings.dark_mode != prev_dark_mode:
+                apply_app_theme(prev_dark_mode, update_page=False)
+            page.pop_dialog()
+            page.update()
 
         def _save_settings_click(_ev) -> None:
             settings.api_base_url = (base_url_tf.value or "http://myweb.web.com").strip()
             settings.api_check_path = (check_path_tf.value or "/api/plate/check").strip()
             settings.api_violation_path = (viol_path_tf.value or "/api/violation").strip()
             settings.auto_query_enabled = bool(auto_query_switch.value)
+            settings.query_all_plates = bool(all_plates_switch.value)
+            settings.dark_mode = bool(theme_switch.value)
             save_settings(settings)
             api_client.clear_cache()
             page.pop_dialog()
-            render_server_info_panel()
-            bottom_section_container.update()
-            mode_msg = "فعال" if settings.auto_query_enabled else "غیرفعال (دستی)"
-            show_snackbar(f"تنظیمات ذخیره شد. استعلام خودکار: {mode_msg}")
+            apply_app_theme(settings.dark_mode, update_page=True)
+            scope_msg = "تمام پلاک‌ها" if settings.query_all_plates else "فقط پلاک‌های «ع»"
+            theme_msg = "شب" if settings.dark_mode else "روز"
+            show_snackbar(f"تنظیمات ذخیره شد ({scope_msg} | تم {theme_msg}).")
 
         page.show_dialog(
             ft.AlertDialog(
@@ -1189,20 +1346,8 @@ async def main(page: ft.Page) -> None:
                         spacing=10,
                         scroll=ft.ScrollMode.AUTO,
                         controls=[
-                            ft.Container(
-                                padding=ft.Padding.all(10),
-                                border_radius=ft.BorderRadius.all(10),
-                                bgcolor="#161B22",
-                                border=ft.Border.all(1, ft.Colors.BLUE_GREY_800),
-                                content=ft.Column(
-                                    spacing=6,
-                                    controls=[
-                                        auto_query_switch,
-                                        auto_query_hint_text,
-                                    ],
-                                ),
-                            ),
-                            ft.Divider(height=6, color=ft.Colors.BLUE_GREY_800),
+                            switches_card,
+                            ft.Divider(height=6, color=p.border),
                             base_url_tf,
                             check_path_tf,
                             viol_path_tf,
@@ -1210,7 +1355,7 @@ async def main(page: ft.Page) -> None:
                     ),
                 ),
                 actions=[
-                    ft.TextButton("انصراف", on_click=lambda _: page.pop_dialog()),
+                    ft.TextButton("انصراف", on_click=_cancel_settings_click),
                     ft.FilledButton("ذخیره تنظیمات", on_click=_save_settings_click),
                 ],
             )
@@ -1264,6 +1409,18 @@ async def main(page: ft.Page) -> None:
         if plate is None or not (plate.plate_latin or plate.plate_persian):
             show_snackbar(
                 "پلاکی شناسایی نشده است؛ ابتدا دوربین را به سمت پلاک خودرو بگیرید.",
+                is_error=True,
+            )
+            return
+
+        if not should_query_plate(
+            settings,
+            chars_persian=plate.chars_persian,
+            plate_persian=plate.plate_persian,
+            plate_latin=plate.plate_latin,
+        ):
+            show_snackbar(
+                "سوییچ «استعلام تمام پلاکها» غیرفعال است؛ فقط پلاک‌های عمومی (حرف «ع») استعلام می‌شوند.",
                 is_error=True,
             )
             return
@@ -1324,7 +1481,7 @@ async def main(page: ft.Page) -> None:
 
             state.active_plates = result.plates
 
-            # ثبت رنگ آبی اولیه برای پلاک‌های جدید؛ استعلام خودکار فقط در صورت فعال بودن در تنظیمات
+            # ثبت رنگ آبی اولیه؛ ارسال خودکار فقط در صورت فعال بودن استعلام خودکار و تطابق با فیلتر پلاک
             for plate in result.plates:
                 plate_key = plate.plate_latin or plate.plate_persian
                 if not plate_key:
@@ -1339,7 +1496,12 @@ async def main(page: ft.Page) -> None:
                     state.plate_statuses[plate_key] = cached.status
                 elif plate_key not in state.plate_statuses:
                     state.plate_statuses[plate_key] = PlateCheckStatus.PENDING
-                    if settings.auto_query_enabled:
+                    if settings.auto_query_enabled and should_query_plate(
+                        settings,
+                        chars_persian=plate.chars_persian,
+                        plate_persian=plate.plate_persian,
+                        plate_latin=plate.plate_latin,
+                    ):
                         asyncio.create_task(query_plate_server(plate))
 
             # انتخاب اصلی‌ترین پلاک دیده‌شده برای نمایش در بخش پایین صفحه
@@ -1414,14 +1576,14 @@ async def main(page: ft.Page) -> None:
     # حالت تست شبیه‌سازی برای اجرا روی کامپیوتر (دسکتاپ) بدون دوربین اندروید
     # -----------------------------------------------------------------------
     async def run_demo_detection(is_no: bool) -> None:
-        demo_chars = ["1", "2", "ب", "3", "4", "5", "1", "1"]
+        demo_chars = ["1", "2", "ع", "3", "4", "5", "1", "1"]
         demo_crop = await asyncio.to_thread(_create_demo_jpeg, (235, 238, 245), (280, 72))
         demo_plate = PlateDetection(
             norm_box=(0.2, 0.38, 0.8, 0.56),
             pixel_box=(128, 180, 512, 270),
             confidence=0.94,
             plate_persian="".join(demo_chars),
-            plate_latin="12B34511",
+            plate_latin="12EIN34511",
             chars_persian=demo_chars,
             complete=True,
             plate_crop_jpeg=demo_crop,
@@ -1450,7 +1612,7 @@ async def main(page: ft.Page) -> None:
             details={
                 "پاسخ سرور": "NO" if is_no else "OK",
                 "وضعیت مجوز": "غیرمجاز (تخلف)" if is_no else "مجاز برای تردد",
-                "خودرو": "پژو ۲۰۷ سفید (تست شبیه‌ساز)",
+                "ناوگان": "اتوبوس بین‌شهری (تست شبیه‌ساز)",
             },
             latency_ms=42.0,
             checked_at=time.strftime("%H:%M:%S"),
@@ -1545,7 +1707,8 @@ async def main(page: ft.Page) -> None:
 
     retry_camera_btn.on_click = init_camera_pipeline
 
-    async def bootstrap_app() -> None:
+    async def preload_models_in_background() -> None:
+        """بارگذاری بی‌صدای مدل‌های ONNX و شمارنده تخلفات همزمان با نمایش صفحه ورود."""
         await refresh_violation_counter(update_ui=False)
 
         loaded = await asyncio.to_thread(engine.load)
@@ -1556,15 +1719,14 @@ async def main(page: ft.Page) -> None:
             hud_status_text.value = "مدل ONNX در پوشه weights نیست"
             if engine.load_error:
                 server_details_column.controls = [
-                    ft.Text(engine.load_error, size=12, color=ft.Colors.AMBER_300)
+                    ft.Text(engine.load_error, size=12, color=ft.Colors.AMBER_400)
                 ]
         render_server_info_panel()
-        page.update()
-
-        await init_camera_pipeline()
+        if state.is_authenticated:
+            page.update()
 
     # -----------------------------------------------------------------------
-    # چیدمان نهایی: لایه اصلی دوبخشی + لایه تمام‌صفحه ثبت/بازبینی تخلف + نوار عکاسی مستندات
+    # چیدمان نهایی: صفحه ورود (لاگین) -> ورود به لایه اصلی دوبخشی + صفحات تمام‌صفحه
     # -----------------------------------------------------------------------
     main_split_view = ft.Column(
         expand=True,
@@ -1575,21 +1737,44 @@ async def main(page: ft.Page) -> None:
         ],
     )
 
+    main_app_stack = ft.Stack(
+        expand=True,
+        controls=[
+            main_split_view,
+            fullscreen_overlay,
+            evidence_capture_overlay,
+        ],
+    )
+
+    app_root_container = ft.Container(expand=True)
+
+    async def handle_login_success(username: str) -> None:
+        state.is_authenticated = True
+        state.current_username = username
+        app_root_container.content = main_app_stack
+        render_server_info_panel()
+        page.update()
+
+        if not state.camera_started:
+            state.camera_started = True
+            await init_camera_pipeline()
+
+    login_screen = LoginScreen(
+        on_login_success=handle_login_success,
+        dark_mode=settings.dark_mode,
+    )
+    login_screen_ref.append(login_screen)
+    app_root_container.content = login_screen
+
     page.add(
         ft.SafeArea(
             expand=True,
-            content=ft.Stack(
-                expand=True,
-                controls=[
-                    main_split_view,
-                    fullscreen_overlay,
-                    evidence_capture_overlay,
-                ],
-            ),
+            content=app_root_container,
         )
     )
 
-    await bootstrap_app()
+    # پیش‌بارگذاری سریع مدل‌های ONNX در پس‌زمینه هنگام نمایش صفحه ورود
+    asyncio.create_task(preload_models_in_background())
 
 
 if __name__ == "__main__":

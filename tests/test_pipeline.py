@@ -528,4 +528,62 @@ def test_violation_stores_jalali_datetime_and_exports_valid_pdf(tmp_path, monkey
     asyncio.run(run())
 
 
+def test_auth_service_placeholder_and_default_admin_login(monkeypatch) -> None:
+    from services import auth_service
+
+    async def run() -> None:
+        # تابع خالی احراز هویت باید به‌صورت پیش‌فرض None برگرداند
+        assert await auth_service.authenticate_custom("admin", "1") is None
+
+        # ورود موقت با admin / 1 موفق و با رمز غلط ناموفق است
+        ok, _ = await auth_service.authenticate_user("admin", "1")
+        assert ok is True
+        bad_ok, _ = await auth_service.authenticate_user("admin", "wrong")
+        assert bad_ok is False
+        empty_ok, _ = await auth_service.authenticate_user("", "")
+        assert empty_ok is False
+
+        # پس از پیاده‌سازی تابع authenticate_custom در آینده، اولویت با آن است
+        async def _fake_custom(user: str, pwd: str) -> bool:
+            return user == "inspector" and pwd == "9999"
+
+        monkeypatch.setattr(auth_service, "authenticate_custom", _fake_custom)
+        custom_ok, _ = await auth_service.authenticate_user("inspector", "9999")
+        custom_fail, _ = await auth_service.authenticate_user("admin", "1")
+        assert custom_ok is True
+        assert custom_fail is False
+
+    asyncio.run(run())
+
+
+def test_plate_query_filter_ein_only_by_default_and_theme_persistence(tmp_path) -> None:
+    from config import is_public_ein_plate, load_settings, save_settings, should_query_plate
+
+    # پیش‌فرض: استعلام تمام پلاکها غیرفعال (فقط حرف «ع») و تم شب فعال
+    s = load_settings(data_dir=tmp_path)
+    assert s.query_all_plates is False
+    assert s.dark_mode is True
+
+    ein_chars = ["1", "2", "ع", "3", "4", "5", "1", "1"]
+    private_chars = ["1", "2", "ب", "3", "4", "5", "1", "1"]
+
+    assert is_public_ein_plate(chars_persian=ein_chars) is True
+    assert is_public_ein_plate(chars_persian=private_chars) is False
+
+    # در حالت پیش‌فرض فقط پلاک‌های حرف «ع» مجاز به استعلام هستند
+    assert should_query_plate(s, chars_persian=ein_chars, plate_latin="12EIN34511") is True
+    assert should_query_plate(s, chars_persian=private_chars, plate_latin="12B34511") is False
+
+    # با فعال‌سازی سوییچ «استعلام تمام پلاکها» و تغییر به تم روز
+    s.query_all_plates = True
+    s.dark_mode = False
+    save_settings(s, data_dir=tmp_path)
+
+    reloaded = load_settings(data_dir=tmp_path)
+    assert reloaded.query_all_plates is True
+    assert reloaded.dark_mode is False
+    assert should_query_plate(reloaded, chars_persian=private_chars, plate_latin="12B34511") is True
+
+
+
 

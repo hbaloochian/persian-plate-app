@@ -432,19 +432,28 @@ class EditableIranianPlateInput(ft.Container):
                 self._app_page.pop_dialog()
             self._app_page.update()
 
+        is_dark = self._app_page.theme_mode != ft.ThemeMode.LIGHT
         buttons: list[ft.Control] = []
         for ch in PLATE_LETTERS_PERSIAN:
             is_selected = ch == self._selected_letter
+            tile_bg = (
+                ft.Colors.BLUE_700
+                if is_selected
+                else ("#1E293B" if is_dark else "#E2E8F0")
+            )
+            tile_border = (
+                ft.Colors.BLUE_300
+                if is_selected
+                else (ft.Colors.BLUE_GREY_700 if is_dark else "#94A3B8")
+            )
+            tile_fg = ft.Colors.WHITE if (is_selected or is_dark) else "#0F172A"
             buttons.append(
                 ft.Container(
                     width=56 if len(ch) <= 3 else 92,
                     height=44,
                     border_radius=8,
-                    bgcolor=ft.Colors.BLUE_600 if is_selected else "#1E293B",
-                    border=ft.Border.all(
-                        1.5,
-                        ft.Colors.BLUE_300 if is_selected else ft.Colors.BLUE_GREY_700,
-                    ),
+                    bgcolor=tile_bg,
+                    border=ft.Border.all(1.5, tile_border),
                     alignment=ft.Alignment.CENTER,
                     ink=True,
                     on_click=lambda _ev, val=ch: _select_letter(val),
@@ -452,7 +461,7 @@ class EditableIranianPlateInput(ft.Container):
                         ch,
                         size=16 if len(ch) <= 3 else 13,
                         weight=ft.FontWeight.BOLD,
-                        color=ft.Colors.WHITE,
+                        color=tile_fg,
                     ),
                 )
             )
