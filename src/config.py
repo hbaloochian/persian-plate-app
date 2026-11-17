@@ -122,6 +122,9 @@ class AppSettings:
     # تم ظاهری برنامه: True = تم شب (تیره)، False = تم روز (روشن)
     dark_mode: bool = True
 
+    # ورود با اثر انگشت (احراز هویت بیومتریک گوشی): پیش‌فرض غیرفعال
+    biometric_login_enabled: bool = False
+
     # پارامترهای مدل هوش مصنوعی (قابل تنظیم برای توازن سرعت/دقت)
     input_size: int = 640
     cars_conf_threshold: float = 0.55
@@ -178,6 +181,8 @@ def load_settings(data_dir: Path | None = None) -> AppSettings:
             settings.query_all_plates = data["query_all_plates"]
         if isinstance(data.get("dark_mode"), bool):
             settings.dark_mode = data["dark_mode"]
+        if isinstance(data.get("biometric_login_enabled"), bool):
+            settings.biometric_login_enabled = data["biometric_login_enabled"]
     except (OSError, ValueError):
         pass
     return settings
@@ -193,6 +198,7 @@ def save_settings(settings: AppSettings, data_dir: Path | None = None) -> None:
         "auto_query_enabled": bool(settings.auto_query_enabled),
         "query_all_plates": bool(settings.query_all_plates),
         "dark_mode": bool(settings.dark_mode),
+        "biometric_login_enabled": bool(settings.biometric_login_enabled),
     }
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 

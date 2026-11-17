@@ -528,40 +528,34 @@ def test_violation_stores_jalali_datetime_and_exports_valid_pdf(tmp_path, monkey
     asyncio.run(run())
 
 
-def test_auth_service_placeholder_and_default_admin_login(monkeypatch) -> None:
+def test_auth_service_single_admin_login_function() -> None:
+    import inspect
     from services import auth_service
 
-    async def run() -> None:
-        # تابع خالی احراز هویت باید به‌صورت پیش‌فرض None برگرداند
-        assert await auth_service.authenticate_custom("admin", "1") is None
+    # در ماژول احراز هویت باید فقط یک تابع (authenticate_user) وجود داشته باشد
+    defined_funcs = [
+        name
+        for name, obj in inspect.getmembers(auth_service, inspect.isfunction)
+        if obj.__module__ == auth_service.__name__
+    ]
+    assert defined_funcs == ["authenticate_user"]
+    assert not hasattr(auth_service, "authenticate_custom")
 
-        # ورود موقت با admin / 1 موفق و با رمز غلط ناموفق است
-        ok, _ = await auth_service.authenticate_user("admin", "1")
-        assert ok is True
-        bad_ok, _ = await auth_service.authenticate_user("admin", "wrong")
-        assert bad_ok is False
-        empty_ok, _ = await auth_service.authenticate_user("", "")
-        assert empty_ok is False
-
-        # پس از پیاده‌سازی تابع authenticate_custom در آینده، اولویت با آن است
-        async def _fake_custom(user: str, pwd: str) -> bool:
-            return user == "inspector" and pwd == "9999"
-
-        monkeypatch.setattr(auth_service, "authenticate_custom", _fake_custom)
-        custom_ok, _ = await auth_service.authenticate_user("inspector", "9999")
-        custom_fail, _ = await auth_service.authenticate_user("admin", "1")
-        assert custom_ok is True
-        assert custom_fail is False
-
-    asyncio.run(run())
+    ok, _ = auth_service.authenticate_user("admin", "1")
+    assert ok is True
+    bad_ok, _ = auth_service.authenticate_user("admin", "wrong")
+    assert bad_ok is False
+    empty_ok, _ = auth_service.authenticate_user("", "")
+    assert empty_ok is False
 
 
-def test_plate_query_filter_ein_only_by_default_and_theme_persistence(tmp_path) -> None:
+def test_plate_query_filter_ein_only_by_default_and_settings_persistence(tmp_path) -> None:
     from config import is_public_ein_plate, load_settings, save_settings, should_query_plate
 
-    # پیش‌فرض: استعلام تمام پلاکها غیرفعال (فقط حرف «ع») و تم شب فعال
+    # پیش‌فرض: استعلام تمام پلاکها غیرفعال (فقط حرف «ع»)، اثر انگشت غیرفعال و تم شب فعال
     s = load_settings(data_dir=tmp_path)
     assert s.query_all_plates is False
+    assert s.biometric_login_enabled is False
     assert s.dark_mode is True
 
     ein_chars = ["1", "2", "ع", "3", "4", "5", "1", "1"]
@@ -574,13 +568,15 @@ def test_plate_query_filter_ein_only_by_default_and_theme_persistence(tmp_path) 
     assert should_query_plate(s, chars_persian=ein_chars, plate_latin="12EIN34511") is True
     assert should_query_plate(s, chars_persian=private_chars, plate_latin="12B34511") is False
 
-    # با فعال‌سازی سوییچ «استعلام تمام پلاکها» و تغییر به تم روز
+    # با فعال‌سازی سوییچ‌ها و تغییر به تم روز
     s.query_all_plates = True
+    s.biometric_login_enabled = True
     s.dark_mode = False
     save_settings(s, data_dir=tmp_path)
 
     reloaded = load_settings(data_dir=tmp_path)
     assert reloaded.query_all_plates is True
+    assert reloaded.biometric_login_enabled is True
     assert reloaded.dark_mode is False
     assert should_query_plate(reloaded, chars_persian=private_chars, plate_latin="12B34511") is True
 

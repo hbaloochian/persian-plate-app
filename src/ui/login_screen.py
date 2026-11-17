@@ -3,8 +3,8 @@
 ویژگی‌ها:
 - الهام‌گرفته از آیکون رسمی برنامه (`src/assets/icon.png`) با طیف آبی برند `#0065A0`
 - پشتیبانی کامل از تم شب (تیره) و تم روز (روشن)
-- اتصال به سرویس احراز هویت (`services.auth_service`) شامل تابع خالی آماده توسعه
-  و ورود موقت با نام کاربری `admin` و رمز عبور `1`
+- احراز هویت با نام کاربری `admin` و رمز عبور `1`
+- پشتیبانی از ورود با اثر انگشت (احراز هویت بیومتریک گوشی) در صورت فعال بودن در تنظیمات
 """
 
 from __future__ import annotations
@@ -35,10 +35,14 @@ class LoginScreen(ft.Container):
     def __init__(
         self,
         on_login_success: Callable[[str], Awaitable[None]],
+        on_biometric_login: Callable[[], Awaitable[tuple[bool, str]]] | None = None,
+        biometric_enabled: bool = False,
         dark_mode: bool = True,
     ) -> None:
         super().__init__(expand=True, padding=0)
         self._on_login_success = on_login_success
+        self._on_biometric_login = on_biometric_login
+        self._biometric_enabled = biometric_enabled
         self._busy = False
 
         palette = get_theme_palette(dark_mode)
@@ -184,6 +188,32 @@ class LoginScreen(ft.Container):
             on_click=self._handle_login_click,
         )
 
+        self._biometric_progress = ft.ProgressRing(
+            width=18,
+            height=18,
+            stroke_width=2,
+            visible=False,
+        )
+        self.biometric_button = ft.OutlinedButton(
+            visible=bool(biometric_enabled and on_biometric_login is not None),
+            content=ft.Row(
+                alignment=ft.MainAxisAlignment.CENTER,
+                spacing=8,
+                controls=[
+                    self._biometric_progress,
+                    ft.Icon(ft.Icons.FINGERPRINT, size=22, color=BRAND_BLUE),
+                    ft.Text("ورود با اثر انگشت", size=14, weight=ft.FontWeight.BOLD),
+                ],
+            ),
+            style=ft.ButtonStyle(
+                shape=ft.RoundedRectangleBorder(radius=12),
+                side=ft.BorderSide(1.5, BRAND_BLUE),
+                padding=ft.Padding.symmetric(horizontal=20, vertical=13),
+            ),
+            width=float("inf"),
+            on_click=self._handle_biometric_click,
+        )
+
         self._login_card = ft.Container(
             width=380,
             padding=ft.Padding.all(20),
@@ -212,6 +242,7 @@ class LoginScreen(ft.Container):
                     ft.Row(controls=[self.password_field]),
                     self._error_box,
                     self.login_button,
+                    self.biometric_button,
                 ],
             ),
         )
@@ -259,16 +290,30 @@ class LoginScreen(ft.Container):
         self._card_subtitle.color = palette.text_secondary
         self._footer_text.color = palette.text_muted
 
+    def set_biometric_enabled(self, enabled: bool) -> None:
+        """نمایش یا پنهان‌کردن دکمه ورود با اثر انگشت بر اساس تنظیمات کاربر."""
+        self._biometric_enabled = bool(enabled)
+        self.biometric_button.visible = bool(
+            self._biometric_enabled and self._on_biometric_login is not None
+        )
+
+    async def trigger_biometric_login(self) -> None:
+        """درخواست خودکار یا دستی ورود بیومتریک با اثر انگشت گوشی."""
+        if self._biometric_enabled and self._on_biometric_login is not None:
+            await self._handle_biometric_click()
+
     async def _focus_password(self, _e=None) -> None:
         try:
             await self.password_field.focus()
         except Exception:
             pass
 
-    def _set_busy(self, busy: bool) -> None:
+    def _set_busy(self, busy: bool, *, biometric: bool = False) -> None:
         self._busy = busy
-        self._login_progress.visible = busy
+        self._login_progress.visible = busy and not biometric
+        self._biometric_progress.visible = busy and biometric
         self.login_button.disabled = busy
+        self.biometric_button.disabled = busy
         self.username_field.disabled = busy
         self.password_field.disabled = busy
 
@@ -276,10 +321,10 @@ class LoginScreen(ft.Container):
         if self._busy:
             return
         self._error_box.visible = False
-        self._set_busy(True)
+        self._set_busy(True, biometric=False)
         self.update()
         try:
-            ok, message = await authenticate_user(
+            ok, message = authenticate_user(
                 self.username_field.value or "",
                 self.password_field.value or "",
             )
@@ -291,6 +336,30 @@ class LoginScreen(ft.Container):
 
             self._error_text.value = message
             self._error_box.visible = True
+        finally:
+            self._set_busy(False)
+            try:
+                self.update()
+            except Exception:
+                pass
+
+    async def _handle_biometric_click(self, _e=None) -> None:
+        if self._busy or self._on_biometric_login is None:
+            return
+        self._error_box.visible = False
+        self._set_busy(True, biometric=True)
+        try:
+            self.update()
+        except Exception:
+            pass
+        try:
+            ok, message = await self._on_biometric_login()
+            if ok:
+                await self._on_login_success("biometric")
+                return
+            if message:
+                self._error_text.value = message
+                self._error_box.visible = True
         finally:
             self._set_busy(False)
             try:

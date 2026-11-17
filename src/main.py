@@ -25,6 +25,11 @@ import flet.canvas as cv
 import flet_camera as fc
 import flet_permission_handler as fph
 
+try:
+    import flet_local_auth as fla
+except ImportError:  # pragma: no cover - در محیط‌های تست بدون بسته محلی
+    fla = None
+
 # اطمینان از در دسترس بودن ماژول‌های داخل پوشه src در همه محیط‌های اجرا
 SRC_DIR = Path(__file__).resolve().parent
 if str(SRC_DIR) not in sys.path:
@@ -160,8 +165,11 @@ async def main(page: ft.Page) -> None:
     api_client = PlateApiClient(settings=settings)
     permission_handler = fph.PermissionHandler()
     file_picker = ft.FilePicker()
+    local_auth = fla.LocalAuthentication() if fla is not None else None
     if hasattr(page, "services"):
         page.services.append(file_picker)
+        if local_auth is not None:
+            page.services.append(local_auth)
 
     # -----------------------------------------------------------------------
     # کنترل‌های بخش بالای صفحه (دوربین زنده + کادرهای Canvas + نوار HUD)
@@ -190,6 +198,9 @@ async def main(page: ft.Page) -> None:
         size=11,
         color=ft.Colors.WHITE,
         weight=ft.FontWeight.W_500,
+        max_lines=1,
+        overflow=ft.TextOverflow.ELLIPSIS,
+        expand=True,
     )
     hud_fps_text = ft.Text(
         "FPS: --",
@@ -275,9 +286,12 @@ async def main(page: ft.Page) -> None:
         content=ft.Row(
             alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
             vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            spacing=6,
             controls=[
                 ft.Row(
-                    spacing=8,
+                    expand=True,
+                    spacing=6,
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
                     controls=[
                         ft.Icon(ft.Icons.MEMORY, size=16, color=ft.Colors.LIGHT_BLUE_300),
                         hud_status_text,
@@ -287,19 +301,33 @@ async def main(page: ft.Page) -> None:
                 ),
                 ft.Row(
                     spacing=0,
+                    tight=True,
                     controls=[flash_btn, pause_btn, settings_btn],
                 ),
             ],
         ),
     )
 
+    centered_camera_holder = ft.Container(
+        expand=True,
+        width=float("inf"),
+        bgcolor=ft.Colors.BLACK,
+        alignment=ft.Alignment.CENTER,
+        content=camera_control,
+    )
+
     top_camera_section = ft.Container(
         expand=5,
+        width=float("inf"),
         bgcolor=ft.Colors.BLACK,
+        alignment=ft.Alignment.CENTER,
+        clip_behavior=ft.ClipBehavior.HARD_EDGE,
         content=ft.Stack(
             expand=True,
+            alignment=ft.Alignment.CENTER,
+            fit=ft.StackFit.EXPAND,
             controls=[
-                camera_control,
+                centered_camera_holder,
                 camera_fallback_overlay,
                 top_hud_bar,
             ],
@@ -1220,7 +1248,7 @@ async def main(page: ft.Page) -> None:
             page.update()
 
     # -----------------------------------------------------------------------
-    # دیالوگ تنظیمات (سوییچ استعلام خودکار + سوییچ استعلام تمام پلاکها + سوییچ تم روز/شب + آدرس سرور)
+    # دیالوگ تنظیمات (سوییچ‌های استعلام، اثر انگشت، تم روز/شب + آدرس سرور)
     # -----------------------------------------------------------------------
     def open_settings_dialog(_e=None) -> None:
         prev_dark_mode = settings.dark_mode
@@ -1230,57 +1258,16 @@ async def main(page: ft.Page) -> None:
         check_path_tf = ft.TextField(label="مسیر استعلام پلاک", value=settings.api_check_path)
         viol_path_tf = ft.TextField(label="مسیر ثبت تخلف", value=settings.api_violation_path)
 
-        def _auto_query_hint(enabled: bool) -> str:
-            if enabled:
-                return "فعال: بلافاصله پس از تشخیص پلاک، استعلام به‌صورت خودکار انجام می‌شود."
-            return "غیرفعال (پیش‌فرض): استعلام فقط با فشردن دکمه «استعلام پلاک» انجام می‌شود."
-
-        def _all_plates_hint(enabled: bool) -> str:
-            if enabled:
-                return "فعال: تمامی پلاک‌های خودرو برای استعلام به سرور ارسال می‌شوند."
-            return "غیرفعال (پیش‌فرض): فقط پلاک‌های عمومی دارای حرف «ع» برای استعلام ارسال می‌شوند."
-
-        def _theme_hint(is_dark: bool) -> str:
-            return "حالت فعلی: تم شب (تیره)" if is_dark else "حالت فعلی: تم روز (روشن)"
-
-        auto_query_hint_text = ft.Text(
-            _auto_query_hint(settings.auto_query_enabled),
-            size=11,
-            color=p.text_secondary,
-        )
-        all_plates_hint_text = ft.Text(
-            _all_plates_hint(settings.query_all_plates),
-            size=11,
-            color=p.text_secondary,
-        )
-        theme_hint_text = ft.Text(
-            _theme_hint(settings.dark_mode),
-            size=11,
-            color=p.text_secondary,
-        )
-
         switches_card = ft.Container(
-            padding=ft.Padding.all(10),
+            padding=ft.Padding.symmetric(horizontal=10, vertical=8),
             border_radius=ft.BorderRadius.all(10),
             bgcolor=p.card_bg,
             border=ft.Border.all(1, p.border),
         )
 
-        def _on_auto_query_toggle(ev: ft.ControlEvent) -> None:
-            auto_query_hint_text.value = _auto_query_hint(bool(ev.control.value))
-            auto_query_hint_text.update()
-
-        def _on_all_plates_toggle(ev: ft.ControlEvent) -> None:
-            all_plates_hint_text.value = _all_plates_hint(bool(ev.control.value))
-            all_plates_hint_text.update()
-
         def _on_theme_toggle(ev: ft.ControlEvent) -> None:
             is_dark = bool(ev.control.value)
             new_p = get_theme_palette(is_dark)
-            theme_hint_text.value = _theme_hint(is_dark)
-            auto_query_hint_text.color = new_p.text_secondary
-            all_plates_hint_text.color = new_p.text_secondary
-            theme_hint_text.color = new_p.text_secondary
             switches_card.bgcolor = new_p.card_bg
             switches_card.border = ft.Border.all(1, new_p.border)
             apply_app_theme(is_dark, update_page=True)
@@ -1288,30 +1275,28 @@ async def main(page: ft.Page) -> None:
         auto_query_switch = ft.Switch(
             label="استعلام خودکار",
             value=settings.auto_query_enabled,
-            on_change=_on_auto_query_toggle,
         )
         all_plates_switch = ft.Switch(
             label="استعلام تمام پلاکها",
             value=settings.query_all_plates,
-            on_change=_on_all_plates_toggle,
+        )
+        biometric_switch = ft.Switch(
+            label="ورود با اثر انگشت",
+            value=settings.biometric_login_enabled,
         )
         theme_switch = ft.Switch(
-            label="تم شب / روز (فعال = شب)",
+            label="تم شب / روز",
             value=settings.dark_mode,
             on_change=_on_theme_toggle,
         )
 
         switches_card.content = ft.Column(
-            spacing=6,
+            spacing=4,
             controls=[
                 auto_query_switch,
-                auto_query_hint_text,
-                ft.Divider(height=6, color=p.border),
                 all_plates_switch,
-                all_plates_hint_text,
-                ft.Divider(height=6, color=p.border),
+                biometric_switch,
                 theme_switch,
-                theme_hint_text,
             ],
         )
 
@@ -1327,14 +1312,15 @@ async def main(page: ft.Page) -> None:
             settings.api_violation_path = (viol_path_tf.value or "/api/violation").strip()
             settings.auto_query_enabled = bool(auto_query_switch.value)
             settings.query_all_plates = bool(all_plates_switch.value)
+            settings.biometric_login_enabled = bool(biometric_switch.value)
             settings.dark_mode = bool(theme_switch.value)
             save_settings(settings)
             api_client.clear_cache()
+            if login_screen_ref:
+                login_screen_ref[0].set_biometric_enabled(settings.biometric_login_enabled)
             page.pop_dialog()
             apply_app_theme(settings.dark_mode, update_page=True)
-            scope_msg = "تمام پلاک‌ها" if settings.query_all_plates else "فقط پلاک‌های «ع»"
-            theme_msg = "شب" if settings.dark_mode else "روز"
-            show_snackbar(f"تنظیمات ذخیره شد ({scope_msg} | تم {theme_msg}).")
+            show_snackbar("تنظیمات با موفقیت ذخیره شد.")
 
         page.show_dialog(
             ft.AlertDialog(
@@ -1726,11 +1712,51 @@ async def main(page: ft.Page) -> None:
             page.update()
 
     # -----------------------------------------------------------------------
+    # احراز هویت بیومتریک (اثر انگشت گوشی) با flet-local-auth
+    # -----------------------------------------------------------------------
+    async def handle_biometric_auth() -> tuple[bool, str]:
+        if local_auth is None or fla is None:
+            return False, "ماژول احراز هویت بیومتریک روی این دستگاه در دسترس نیست."
+
+        if page.platform in (ft.PagePlatform.LINUX,) or page.web:
+            return False, "ورود با اثر انگشت فقط روی گوشی اندروید/iOS پشتیبانی می‌شود."
+
+        try:
+            supported = await local_auth.is_device_supported()
+            can_check = await local_auth.can_check_biometrics()
+            if not (supported or can_check):
+                return False, "این گوشی فاقد سخت‌افزار اثر انگشت یا قفل بیومتریک فعال است."
+
+            ok = await local_auth.authenticate(
+                "برای ورود به پلاک‌خوان هوشمند، اثر انگشت خود را اسکن کنید",
+                biometric_only=False,
+                android_messages=fla.AndroidAuthMessages(
+                    sign_in_title="ورود با اثر انگشت",
+                    sign_in_hint="حسگر اثر انگشت گوشی را لمس کنید",
+                    cancel_button="انصراف",
+                ),
+            )
+            if ok:
+                return True, "احراز هویت بیومتریک تأیید شد."
+            return False, "تأیید اثر انگشت انجام نشد."
+        except Exception as exc:
+            err_code = getattr(getattr(exc, "code", None), "value", "") or str(exc)
+            if "cancel" in err_code.lower():
+                return False, ""
+            if "notEnrolled" in err_code or "noCredentials" in err_code:
+                return False, "ابتدا اثر انگشت خود را در تنظیمات امنیتی گوشی ثبت کنید."
+            if "lockout" in err_code.lower():
+                return False, "تلاش‌های ناموفق زیاد بود؛ لحظاتی دیگر مجدد امتحان کنید."
+            logger.warning("Biometric authentication error: %s", exc)
+            return False, f"خطا در احراز هویت اثر انگشت: {err_code}"
+
+    # -----------------------------------------------------------------------
     # چیدمان نهایی: صفحه ورود (لاگین) -> ورود به لایه اصلی دوبخشی + صفحات تمام‌صفحه
     # -----------------------------------------------------------------------
     main_split_view = ft.Column(
         expand=True,
         spacing=0,
+        horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
         controls=[
             top_camera_section,
             bottom_section_container,
@@ -1739,6 +1765,7 @@ async def main(page: ft.Page) -> None:
 
     main_app_stack = ft.Stack(
         expand=True,
+        fit=ft.StackFit.EXPAND,
         controls=[
             main_split_view,
             fullscreen_overlay,
@@ -1761,6 +1788,8 @@ async def main(page: ft.Page) -> None:
 
     login_screen = LoginScreen(
         on_login_success=handle_login_success,
+        on_biometric_login=handle_biometric_auth,
+        biometric_enabled=settings.biometric_login_enabled,
         dark_mode=settings.dark_mode,
     )
     login_screen_ref.append(login_screen)
@@ -1775,6 +1804,18 @@ async def main(page: ft.Page) -> None:
 
     # پیش‌بارگذاری سریع مدل‌های ONNX در پس‌زمینه هنگام نمایش صفحه ورود
     asyncio.create_task(preload_models_in_background())
+
+    # در صورت فعال بودن ورود با اثر انگشت روی گوشی، پنجره اثر انگشت به‌صورت خودکار باز می‌شود
+    if settings.biometric_login_enabled and page.platform in (
+        ft.PagePlatform.ANDROID,
+        ft.PagePlatform.IOS,
+    ):
+        async def _auto_biometric_prompt() -> None:
+            await asyncio.sleep(0.35)
+            if not state.is_authenticated:
+                await login_screen.trigger_biometric_login()
+
+        asyncio.create_task(_auto_biometric_prompt())
 
 
 if __name__ == "__main__":
