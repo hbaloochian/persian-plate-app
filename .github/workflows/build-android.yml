@@ -1,10 +1,7 @@
 name: Build Android APK (Fast Cached)
 
 on:
-  push:
-    branches: [ main, master ]
-  pull_request:
-    branches: [ main, master ]
+
   workflow_dispatch:
     inputs:
       auto_export_onnx:
