@@ -581,5 +581,169 @@ def test_plate_query_filter_ein_only_by_default_and_settings_persistence(tmp_pat
     assert should_query_plate(reloaded, chars_persian=private_chars, plate_latin="12B34511") is True
 
 
+def test_multiframe_plate_stabilizer_corrects_noise_and_switches_vehicles() -> None:
+    from core.plate_stabilizer import MultiFramePlateStabilizer
+
+    stab = MultiFramePlateStabilizer(window_size=5, min_confirmations=2, max_age_sec=3.0)
+
+    # فریم اول: هنوز تأیید چندفریمی نشده است
+    r1 = stab.update(["1", "2", "ع", "3", "4", "5", "1", "1"], 0.85, now=10.0)
+    assert r1 is not None
+    assert r1.plate_latin == "12EIN34511"
+    assert r1.is_confirmed is False
+
+    # فریم دوم منطبق: پلاک تثبیت می‌شود
+    r2 = stab.update(["1", "2", "ع", "3", "4", "5", "1", "1"], 0.90, now=10.4)
+    assert r2 is not None
+    assert r2.is_confirmed is True
+    assert r2.votes_count == 2
+
+    # فریم سوم با خطای تک‌فریمی OCR (رقم ۳ اشتباهاً ۸ خوانده شده): رأی‌گیری اکثریت آن را اصلاح می‌کند
+    r3 = stab.update(["1", "2", "ع", "8", "4", "5", "1", "1"], 0.72, now=10.8)
+    assert r3 is not None
+    assert r3.plate_latin == "12EIN34511"
+    assert r3.is_confirmed is True
+    assert r3.votes_count == 3
+
+    # یک فریم کاملاً متفاوت (نویز یا عبور لحظه‌ای خودروی دیگر): نادیده گرفته می‌شود تا نمایشگر پرش نکند
+    r_glitch = stab.update(["9", "9", "ب", "7", "6", "5", "4", "4"], 0.65, now=11.1)
+    assert r_glitch is not None
+    assert r_glitch.plate_latin == "12EIN34511"
+    assert r_glitch.is_glitch_ignored is True
+
+    # فریم دوم متوالی از خودروی جدید: بافر سریعاً روی خودروی جدید سوئیچ می‌کند
+    r_switch = stab.update(["9", "9", "ب", "7", "6", "5", "4", "4"], 0.91, now=11.5)
+    assert r_switch is not None
+    assert r_switch.plate_latin == "99B76544"
+    assert r_switch.is_confirmed is True
+    assert r_switch.is_glitch_ignored is False
+
+    # پس از گذشت زمان max_age_sec فریم‌های قدیمی منقضی می‌شوند
+    r_fresh = stab.update(["5", "5", "ص", "1", "1", "1", "2", "2"], 0.88, now=20.0)
+    assert r_fresh is not None
+    assert r_fresh.plate_latin == "55SAD11122"
+    assert r_fresh.votes_count == 1
+    assert r_fresh.is_confirmed is False
+
+
+def test_violation_gps_storage_retry_and_pdf_report(tmp_path, monkeypatch) -> None:
+    import json
+    from services.pdf_report import generate_violation_pdf_bytes
+
+    monkeypatch.setenv("FLET_APP_STORAGE_DATA", str(tmp_path))
+    captured_payloads: list[dict] = []
+    status_code = 503
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured_payloads.append(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(status_code, text="OK" if status_code == 200 else "ERR")
+
+    async def run() -> None:
+        nonlocal status_code
+        client = PlateApiClient(AppSettings())
+        client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            res = await client.submit_violation(
+                plate_persian="۱۲ ع ۳۴۵ | ایران ۱۱",
+                plate_latin="12EIN34511",
+                violation_type="حرکت خارج از مسیر راهنامه/پروانه",
+                description="خروج از مسیر مجاز جاده‌ای",
+                latitude=35.689214,
+                longitude=51.389012,
+                location_accuracy_m=11.8,
+            )
+            assert res.success is False
+            assert captured_payloads[0]["latitude"] == pytest.approx(35.689214)
+            assert captured_payloads[0]["longitude"] == pytest.approx(51.389012)
+            assert captured_payloads[0]["location_accuracy_m"] == pytest.approx(11.8)
+
+            records = load_violation_records()
+            assert len(records) == 1
+            rec = records[0]
+            assert rec.has_gps is True
+            assert "35.689214, 51.389012" in rec.formatted_gps
+            assert "±12m" in rec.formatted_gps
+            assert rec.google_maps_url == "https://maps.google.com/?q=35.689214,51.389012"
+
+            # ارسال مجدد باید مختصات GPS را حفظ کند
+            status_code = 200
+            retry_res = await client.retry_violation_sync(rec)
+            assert retry_res.success is True
+            assert captured_payloads[1]["latitude"] == pytest.approx(35.689214)
+
+            # گزارش PDF تک‌تخلف با حضور GPS باید معتبر تولید شود
+            pdf_bytes = generate_violation_pdf_bytes(rec)
+            assert pdf_bytes.startswith(b"%PDF-")
+            assert len(pdf_bytes) > 10_000
+        finally:
+            await client.close()
+
+    asyncio.run(run())
+
+
+def test_violation_history_search_filter_and_batch_pdf_csv_exports() -> None:
+    from services.api_client import ViolationRecord, filter_violation_records
+    from services.pdf_report import (
+        build_batch_export_filename,
+        generate_batch_violations_csv_bytes,
+        generate_batch_violations_pdf_bytes,
+        generate_batch_violations_pdf_images,
+    )
+
+    records = [
+        ViolationRecord(
+            id=f"v-{i}",
+            plate=f"{10 + i} ع {300 + i} | ایران ۱۱" if i % 2 == 0 else f"{20 + i} ب {400 + i} | ایران ۲۲",
+            plate_latin=f"{10 + i}EIN{300 + i}11" if i % 2 == 0 else f"{20 + i}B{400 + i}22",
+            violation_type="اضافه تناژ" if i % 3 == 0 else "نداشتن صورت وضعیت مسافری",
+            description=f"یادداشت شماره {i}",
+            timestamp="2026-11-14T10:00:00+00:00",
+            jalali_date="1405/08/23",
+            jalali_time=f"13:{i:02d}:00",
+            latitude=35.7000 + i * 0.001 if i % 2 == 0 else None,
+            longitude=51.4000 + i * 0.001 if i % 2 == 0 else None,
+            location_accuracy_m=10.0 if i % 2 == 0 else None,
+            synced=(i % 2 == 0),
+        )
+        for i in range(1, 23)
+    ]
+
+    # فیلتر وضعیت ارسال و GPS
+    assert len(filter_violation_records(records, sync_filter="synced")) == 11
+    assert len(filter_violation_records(records, sync_filter="pending")) == 11
+    assert len(filter_violation_records(records, sync_filter="gps")) == 11
+
+    # فیلتر نوع تخلف
+    overweight = filter_violation_records(records, violation_type="اضافه تناژ")
+    assert len(overweight) == 7
+    assert all(r.violation_type == "اضافه تناژ" for r in overweight)
+
+    # جستجو با ارقام فارسی منطبق با کد لاتین/پلاک
+    found = filter_violation_records(records, search_query="۱۲ ع ۳۰۲")
+    assert len(found) == 1
+    assert found[0].id == "v-2"
+
+    # نام فایل خروجی گروهی
+    assert build_batch_export_filename("pdf").endswith(".pdf")
+    assert build_batch_export_filename("csv").endswith(".csv")
+
+    # خروجی PDF گروهی چندصفحه‌ای (۲۲ رکورد -> حداقل ۲ صفحه A4)
+    pages = generate_batch_violations_pdf_images(records, filter_summary="فیلتر: همه تخلفات")
+    assert len(pages) >= 2
+    batch_pdf = generate_batch_violations_pdf_bytes(records, filter_summary="فیلتر: همه تخلفات")
+    assert batch_pdf.startswith(b"%PDF-")
+    assert len(batch_pdf) > 20_000
+
+    # خروجی اکسل CSV با UTF-8 BOM
+    csv_bytes = generate_batch_violations_csv_bytes(records)
+    assert csv_bytes.startswith(b"\xef\xbb\xbf")
+    csv_text = csv_bytes.decode("utf-8-sig")
+    assert "شماره پلاک فارسی" in csv_text
+    assert "عرض جغرافیایی (Lat)" in csv_text
+    assert "12EIN30211" in csv_text
+    assert "https://maps.google.com/?q=" in csv_text
+
+
+
 
 

@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import csv
 import io
 import logging
 import os
@@ -510,6 +511,10 @@ def generate_violation_pdf_image(
         jalali_date_full = jalali_date_display
 
     jalali_time_display = to_persian_digits(record.jalali_time) if record.jalali_time else "---"
+    if record.has_gps:
+        gps_display = f"{record.formatted_gps}\n{record.google_maps_url}"
+    else:
+        gps_display = "ثبت نشده"
     server_resp_display = record.server_response.strip() if record.server_response else "---"
     notes_display = record.description.strip() if record.description else "توضیحاتی ثبت نشده است."
 
@@ -518,6 +523,7 @@ def generate_violation_pdf_image(
         ("نوع تخلف", record.violation_type),
         ("تاریخ شمسی تخلف", jalali_date_full),
         ("ساعت وقوع تخلف", jalali_time_display),
+        ("موقعیت مکانی (GPS)", gps_display),
         ("پاسخ سرور", server_resp_display),
         ("توضیحات تکمیلی", notes_display),
     ]
@@ -533,10 +539,10 @@ def generate_violation_pdf_image(
             raw_val,
             measure_fn=lambda s: _text_width(draw, s, f_value),
             max_width=value_col_w - 42,
-            max_lines=4 if label == "توضیحات تکمیلی" else 2,
+            max_lines=3 if label == "توضیحات تکمیلی" else 2,
         ) or ["---"]
-        line_h = 34
-        row_h = max(56, len(wrapped) * line_h + 22)
+        line_h = 32
+        row_h = max(50, len(wrapped) * line_h + 18)
 
         row_bg = COLOR_ROW_ALT if idx % 2 == 1 else (255, 255, 255)
         # پس‌زمینه ردیف
@@ -706,3 +712,409 @@ def try_write_pdf_to_downloads(pdf_bytes: bytes, filename: str) -> tuple[bool, P
             logger.info("Direct Downloads write to '%s' unavailable (%s)", dl_dir, exc)
 
     return False, None, last_error
+
+
+# =============================================================================
+# خروجی گروهی تخلفات (گزارش PDF چندصفحه‌ای تجمیعی + فایل CSV سازگار با اکسل)
+# =============================================================================
+
+
+def build_batch_export_filename(ext: str = "pdf", prefix: str = "گزارش-تجمیعی-تخلفات") -> str:
+    """نام فایل خروجی گروهی را بر اساس تاریخ و ساعت شمسی می‌سازد."""
+    now_ir = now_iran_datetime()
+    date_part = format_jalali_date(now_ir, persian_digits=False).replace("/", "-")
+    time_part = format_jalali_time(now_ir, persian_digits=False).replace(":", "")
+    clean_ext = ext.lstrip(".").lower() or "pdf"
+    return f"{prefix}-{date_part}-{time_part}.{clean_ext}"
+
+
+def generate_batch_violations_csv_bytes(records: list[ViolationRecord]) -> bytes:
+    """فایل CSV با کدگذاری UTF-8 BOM (بازشدن بدون بهم‌ریختگی فارسی در Excel) تولید می‌کند."""
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(
+        [
+            "ردیف",
+            "شناسه تخلف",
+            "شماره پلاک فارسی",
+            "کد لاتین پلاک",
+            "نوع تخلف",
+            "تاریخ شمسی",
+            "روز هفته",
+            "ساعت ثبت",
+            "عرض جغرافیایی (Lat)",
+            "طول جغرافیایی (Lon)",
+            "دقت GPS (متر)",
+            "لینک نقشه",
+            "وضعیت ارسال به سرور",
+            "پاسخ سرور",
+            "توضیحات تکمیلی",
+        ]
+    )
+
+    for idx, rec in enumerate(records, start=1):
+        writer.writerow(
+            [
+                idx,
+                rec.id,
+                rec.plate,
+                rec.plate_latin,
+                rec.violation_type,
+                rec.jalali_date,
+                rec.jalali_weekday,
+                rec.jalali_time,
+                f"{rec.latitude:.6f}" if rec.latitude is not None else "",
+                f"{rec.longitude:.6f}" if rec.longitude is not None else "",
+                f"{rec.location_accuracy_m:.1f}" if rec.location_accuracy_m is not None else "",
+                rec.google_maps_url,
+                "ارسال‌شده" if rec.synced else "در انتظار ارسال",
+                rec.server_response,
+                rec.description,
+            ]
+        )
+
+    # utf-8-sig (BOM) باعث نمایش صحیح حروف فارسی در Microsoft Excel می‌شود
+    return buf.getvalue().encode("utf-8-sig")
+
+
+def generate_batch_violations_pdf_images(
+    records: list[ViolationRecord],
+    *,
+    filter_summary: str = "",
+) -> list[Image.Image]:
+    """گزارش تجمیعی چندصفحه‌ای A4 از تخلفات فیلترشده را تولید می‌کند."""
+    reg_path, bold_path = _find_font_paths()
+
+    f_title = _load_font(bold_path, 32)
+    f_subtitle = _load_font(reg_path, 19)
+    f_kpi_num = _load_font(bold_path, 28)
+    f_kpi_lbl = _load_font(reg_path, 16)
+    f_th = _load_font(bold_path, 17)
+    f_cell = _load_font(reg_path, 16)
+    f_cell_bold = _load_font(bold_path, 16)
+    f_cell_sm = _load_font(reg_path, 14)
+    f_footer = _load_font(reg_path, 16)
+
+    now_ir = now_iran_datetime()
+    generated_jalali = to_persian_digits(
+        f"{format_jalali_date(now_ir)} - {format_jalali_time(now_ir)}"
+    )
+
+    table_w = PAGE_W - 2 * MARGIN  # 1112px
+    # ستون‌ها از راست به چپ: ردیف، پلاک، نوع تخلف و توضیحات، تاریخ/ساعت، GPS، وضعیت
+    col_specs = [
+        ("ردیف", 56),
+        ("شماره پلاک", 216),
+        ("نوع تخلف و توضیحات", 340),
+        ("تاریخ و ساعت شمسی", 190),
+        ("موقعیت GPS", 196),
+        ("وضعیت", 114),
+    ]
+    assert sum(w for _, w in col_specs) == table_w
+
+    # محاسبه بازه‌های افقی هر ستون از راست به چپ
+    col_bounds: list[tuple[int, int, str]] = []
+    cursor_right = PAGE_W - MARGIN
+    for title, width in col_specs:
+        col_bounds.append((cursor_right - width, cursor_right, title))
+        cursor_right -= width
+
+    pages: list[Image.Image] = []
+
+    def _new_page(is_first: bool) -> tuple[Image.Image, ImageDraw.ImageDraw, int]:
+        img = Image.new("RGB", (PAGE_W, PAGE_H), COLOR_BG)
+        drw = ImageDraw.Draw(img)
+
+        if is_first:
+            header_h = 152
+            drw.rectangle((0, 0, PAGE_W, header_h), fill=COLOR_PRIMARY)
+            drw.rectangle((0, header_h - 8, PAGE_W, header_h), fill=COLOR_PRIMARY_DARK)
+
+            icon_size = 96
+            icon_x = PAGE_W - MARGIN - icon_size
+            icon_y = (header_h - 8 - icon_size) // 2
+            icon_path = APP_DIR / "assets" / "icon.png"
+            if icon_path.is_file():
+                try:
+                    with Image.open(icon_path) as ico:
+                        ico_rgba = ico.convert("RGBA").resize(
+                            (icon_size, icon_size), Image.Resampling.LANCZOS
+                        )
+                        drw.ellipse(
+                            (icon_x - 3, icon_y - 3, icon_x + icon_size + 3, icon_y + icon_size + 3),
+                            fill=(255, 255, 255),
+                        )
+                        img.paste(ico_rgba, (icon_x, icon_y), ico_rgba)
+                except Exception:
+                    pass
+
+            _draw_rtl_text(
+                drw, icon_x - 20, 30, "گزارش تجمیعی تخلفات ثبت‌شده", f_title, (255, 255, 255)
+            )
+            sub = filter_summary.strip() or "سامانه هوشمند پلاک‌خوان و مستندسازی تخلفات"
+            _draw_rtl_text(drw, icon_x - 20, 86, sub, f_subtitle, (219, 234, 254))
+
+            # تاریخ صدور سمت چپ سربرگ
+            meta_w = 310
+            drw.rounded_rectangle(
+                (MARGIN, 34, MARGIN + meta_w, 114),
+                radius=12,
+                fill=COLOR_PRIMARY_DARK,
+                outline=(147, 197, 253),
+                width=2,
+            )
+            _draw_centered_text(
+                drw, MARGIN + meta_w / 2, 58, "تاریخ صدور گزارش", f_cell_sm, (191, 219, 254)
+            )
+            _draw_centered_text(
+                drw, MARGIN + meta_w / 2, 90, generated_jalali, f_cell_bold, (255, 255, 255)
+            )
+
+            # کارت‌های آمار خلاصه (KPI)
+            y_kpi = header_h + 24
+            kpi_h = 84
+            kpi_gap = 16
+            kpi_w = (table_w - 3 * kpi_gap) // 4
+            total_n = len(records)
+            synced_n = sum(1 for r in records if r.synced)
+            pending_n = total_n - synced_n
+            gps_n = sum(1 for r in records if r.has_gps)
+
+            kpis = [
+                ("کل تخلفات", to_persian_digits(str(total_n)), COLOR_PRIMARY, COLOR_LABEL_BG),
+                ("ارسال‌شده به سرور", to_persian_digits(str(synced_n)), COLOR_GREEN, COLOR_GREEN_BG),
+                ("در انتظار ارسال", to_persian_digits(str(pending_n)), COLOR_ORANGE, COLOR_ORANGE_BG),
+                ("دارای موقعیت GPS", to_persian_digits(str(gps_n)), COLOR_PRIMARY_DARK, COLOR_ROW_ALT),
+            ]
+            # رسم از راست به چپ
+            for k_idx, (lbl, val, fg_col, bg_col) in enumerate(kpis):
+                kx1 = PAGE_W - MARGIN - k_idx * (kpi_w + kpi_gap)
+                kx0 = kx1 - kpi_w
+                drw.rounded_rectangle(
+                    (kx0, y_kpi, kx1, y_kpi + kpi_h),
+                    radius=12,
+                    fill=bg_col,
+                    outline=COLOR_BORDER,
+                    width=2,
+                )
+                _draw_centered_text(drw, (kx0 + kx1) / 2, y_kpi + 30, val, f_kpi_num, fg_col, apply_rtl=False)
+                _draw_centered_text(drw, (kx0 + kx1) / 2, y_kpi + 64, lbl, f_kpi_lbl, COLOR_TEXT_MAIN)
+
+            y_start = y_kpi + kpi_h + 24
+        else:
+            drw.rectangle((0, 0, PAGE_W, 74), fill=COLOR_PRIMARY)
+            _draw_rtl_text(
+                drw,
+                PAGE_W - MARGIN,
+                22,
+                "ادامه گزارش تجمیعی تخلفات ثبت‌شده",
+                f_subtitle,
+                (255, 255, 255),
+            )
+            drw.text((MARGIN, 26), to_visual_rtl(generated_jalali), font=f_cell_sm, fill=(219, 234, 254))
+            y_start = 98
+
+        # هدر جدول
+        th_h = 46
+        drw.rectangle((MARGIN, y_start, PAGE_W - MARGIN, y_start + th_h), fill=COLOR_PRIMARY_DARK)
+        for cx0, cx1, title in col_bounds:
+            _draw_centered_text(drw, (cx0 + cx1) / 2, y_start + th_h / 2, title, f_th, (255, 255, 255))
+            drw.line((cx0, y_start, cx0, y_start + th_h), fill=(100, 140, 190), width=1)
+        drw.rectangle(
+            (MARGIN, y_start, PAGE_W - MARGIN, y_start + th_h),
+            outline=COLOR_PRIMARY_DARK,
+            width=2,
+        )
+
+        return img, drw, y_start + th_h
+
+    cur_img, cur_draw, y = _new_page(is_first=True)
+    max_body_y = PAGE_H - 92
+
+    if not records:
+        row_h = 84
+        cur_draw.rectangle((MARGIN, y, PAGE_W - MARGIN, y + row_h), fill=COLOR_ROW_ALT, outline=COLOR_BORDER, width=2)
+        _draw_centered_text(
+            cur_draw,
+            PAGE_W / 2,
+            y + row_h / 2,
+            "هیچ تخلفی مطابق فیلتر انتخاب‌شده یافت نشد.",
+            f_subtitle,
+            COLOR_TEXT_MUTED,
+        )
+        pages.append(cur_img)
+    else:
+        for row_idx, rec in enumerate(records, start=1):
+            vtype_lines = wrap_persian_lines(
+                rec.violation_type,
+                measure_fn=lambda s: _text_width(cur_draw, s, f_cell_bold),
+                max_width=col_specs[2][1] - 20,
+                max_lines=2,
+            ) or ["---"]
+            note_lines = (
+                wrap_persian_lines(
+                    rec.description.strip(),
+                    measure_fn=lambda s: _text_width(cur_draw, s, f_cell_sm),
+                    max_width=col_specs[2][1] - 20,
+                    max_lines=2,
+                )
+                if rec.description.strip()
+                else []
+            )
+            plate_lines = wrap_persian_lines(
+                to_persian_digits(rec.plate),
+                measure_fn=lambda s: _text_width(cur_draw, s, f_cell_bold),
+                max_width=col_specs[1][1] - 16,
+                max_lines=2,
+            ) or ["---"]
+
+            content_lines = max(
+                len(vtype_lines) + len(note_lines),
+                len(plate_lines),
+                2,
+            )
+            row_h = max(62, content_lines * 24 + 20)
+
+            if y + row_h > max_body_y:
+                pages.append(cur_img)
+                cur_img, cur_draw, y = _new_page(is_first=False)
+
+            bg = COLOR_ROW_ALT if row_idx % 2 == 0 else (255, 255, 255)
+            cur_draw.rectangle((MARGIN, y, PAGE_W - MARGIN, y + row_h), fill=bg, outline=COLOR_BORDER, width=1)
+            for cx0, _cx1, _t in col_bounds:
+                cur_draw.line((cx0, y, cx0, y + row_h), fill=COLOR_BORDER, width=1)
+
+            # ۰) ردیف
+            c0x0, c0x1, _ = col_bounds[0]
+            _draw_centered_text(
+                cur_draw,
+                (c0x0 + c0x1) / 2,
+                y + row_h / 2,
+                to_persian_digits(str(row_idx)),
+                f_cell_bold,
+                COLOR_PRIMARY_DARK,
+                apply_rtl=False,
+            )
+
+            # ۱) شماره پلاک
+            c1x0, c1x1, _ = col_bounds[1]
+            for li, ltxt in enumerate(plate_lines):
+                _draw_centered_text(
+                    cur_draw, (c1x0 + c1x1) / 2, y + 22 + li * 24, ltxt, f_cell_bold, COLOR_TEXT_MAIN
+                )
+
+            # ۲) نوع تخلف + توضیحات
+            c2x0, c2x1, _ = col_bounds[2]
+            ty = y + 10
+            for ltxt in vtype_lines:
+                _draw_rtl_text(cur_draw, c2x1 - 10, ty, ltxt, f_cell_bold, COLOR_TEXT_MAIN)
+                ty += 23
+            for ltxt in note_lines:
+                _draw_rtl_text(cur_draw, c2x1 - 10, ty, ltxt, f_cell_sm, COLOR_TEXT_MUTED)
+                ty += 20
+
+            # ۳) تاریخ و ساعت شمسی
+            c3x0, c3x1, _ = col_bounds[3]
+            _draw_centered_text(
+                cur_draw,
+                (c3x0 + c3x1) / 2,
+                y + 22,
+                to_persian_digits(rec.jalali_date or "---"),
+                f_cell_bold,
+                COLOR_TEXT_MAIN,
+                apply_rtl=False,
+            )
+            _draw_centered_text(
+                cur_draw,
+                (c3x0 + c3x1) / 2,
+                y + 46,
+                to_persian_digits(rec.jalali_time or "---"),
+                f_cell_sm,
+                COLOR_TEXT_MUTED,
+                apply_rtl=False,
+            )
+
+            # ۴) موقعیت GPS
+            c4x0, c4x1, _ = col_bounds[4]
+            if rec.has_gps:
+                _draw_centered_text(
+                    cur_draw,
+                    (c4x0 + c4x1) / 2,
+                    y + 22,
+                    f"{rec.latitude:.5f}, {rec.longitude:.5f}",
+                    f_cell_sm,
+                    COLOR_PRIMARY_DARK,
+                    apply_rtl=False,
+                )
+                acc_str = (
+                    f"دقت: ±{to_persian_digits(str(int(round(rec.location_accuracy_m))))} متر"
+                    if rec.location_accuracy_m
+                    else "ثبت GPS"
+                )
+                _draw_centered_text(
+                    cur_draw, (c4x0 + c4x1) / 2, y + 46, acc_str, f_cell_sm, COLOR_TEXT_MUTED
+                )
+            else:
+                _draw_centered_text(
+                    cur_draw, (c4x0 + c4x1) / 2, y + row_h / 2, "ثبت نشده", f_cell_sm, COLOR_TEXT_MUTED
+                )
+
+            # ۵) وضعیت ارسال
+            c5x0, c5x1, _ = col_bounds[5]
+            st_lbl = "ارسال‌شده" if rec.synced else "در انتظار"
+            st_fg = COLOR_GREEN if rec.synced else COLOR_ORANGE
+            st_bg = COLOR_GREEN_BG if rec.synced else COLOR_ORANGE_BG
+            cur_draw.rounded_rectangle(
+                (c5x0 + 10, y + (row_h - 32) // 2, c5x1 - 10, y + (row_h + 32) // 2),
+                radius=14,
+                fill=st_bg,
+                outline=st_fg,
+                width=1,
+            )
+            _draw_centered_text(
+                cur_draw, (c5x0 + c5x1) / 2, y + row_h / 2, st_lbl, f_cell_sm, st_fg
+            )
+
+            y += row_h
+
+        pages.append(cur_img)
+
+    # درج پاورقی و شماره صفحه روی تمام صفحات
+    total_pages = len(pages)
+    for p_idx, p_img in enumerate(pages, start=1):
+        p_draw = ImageDraw.Draw(p_img)
+        footer_y = PAGE_H - 64
+        p_draw.line((MARGIN, footer_y - 14, PAGE_W - MARGIN, footer_y - 14), fill=COLOR_BORDER, width=2)
+        _draw_rtl_text(
+            p_draw,
+            PAGE_W - MARGIN,
+            footer_y,
+            "گزارش تجمیعی اپلیکیشن پلاک‌خوان هوشمند | نسخه اندروید",
+            f_footer,
+            COLOR_TEXT_MUTED,
+        )
+        page_num_str = to_persian_digits(f"صفحه {p_idx} از {total_pages}")
+        p_draw.text((MARGIN, footer_y), to_visual_rtl(page_num_str), font=f_footer, fill=COLOR_TEXT_MUTED)
+
+    return pages
+
+
+def generate_batch_violations_pdf_bytes(
+    records: list[ViolationRecord],
+    *,
+    filter_summary: str = "",
+) -> bytes:
+    """فایل PDF چندصفحه‌ای گزارش تجمیعی تخلفات را تولید کرده و بایت‌های آن را برمی‌گرداند."""
+    pages = generate_batch_violations_pdf_images(records, filter_summary=filter_summary)
+    buf = io.BytesIO()
+    pages[0].save(
+        buf,
+        format="PDF",
+        resolution=PAGE_DPI,
+        save_all=True,
+        append_images=pages[1:],
+        title="Batch Violations Report",
+        author="Persian Plate Recognition App",
+    )
+    return buf.getvalue()
+

@@ -27,9 +27,13 @@ class ViolationRegistrationPanel(ft.Container):
         self,
         page: ft.Page,
         on_back: Callable[[], None],
-        on_submit: Callable[[str, str, str, str, bool, bytes | None], Awaitable[None]],
+        on_submit: Callable[
+            [str, str, str, str, bool, bytes | None, float | None, float | None, float | None],
+            Awaitable[None],
+        ],
         on_capture_evidence: Callable[[], Awaitable[bytes | None]],
         on_pick_evidence: Callable[[], Awaitable[bytes | None]],
+        on_refresh_gps: Callable[[], Awaitable[None]] | None = None,
         dark_mode: bool = True,
     ) -> None:
         self._palette = get_theme_palette(dark_mode)
@@ -42,9 +46,13 @@ class ViolationRegistrationPanel(ft.Container):
         self._on_submit = on_submit
         self._on_capture_evidence = on_capture_evidence
         self._on_pick_evidence = on_pick_evidence
+        self._on_refresh_gps = on_refresh_gps
         self._submitting = False
         self._capturing_evidence = False
         self._evidence_bytes: bytes | None = None
+        self._gps_lat: float | None = None
+        self._gps_lon: float | None = None
+        self._gps_accuracy: float | None = None
 
         self.datetime_badge = ft.Text(
             "",
@@ -285,6 +293,38 @@ class ViolationRegistrationPanel(ft.Container):
             ),
         )
 
+        # کارت موقعیت مکانی خودکار (GPS)
+        self._gps_icon = ft.Icon(ft.Icons.LOCATION_ON, size=20, color=self._palette.accent_text)
+        self._gps_spinner = ft.ProgressRing(width=16, height=16, stroke_width=2, visible=False)
+        self.gps_status_text = ft.Text(
+            "در حال دریافت موقعیت مکانی (GPS)...",
+            size=12,
+            color=self._palette.text_secondary,
+            expand=True,
+        )
+        self.refresh_gps_btn = ft.IconButton(
+            icon=ft.Icons.MY_LOCATION,
+            icon_size=20,
+            tooltip="دریافت مجدد موقعیت GPS",
+            on_click=self._handle_refresh_gps_click,
+        )
+        self._gps_card = ft.Container(
+            padding=ft.Padding.symmetric(horizontal=12, vertical=8),
+            border_radius=ft.BorderRadius.all(10),
+            bgcolor=self._palette.card_bg,
+            border=ft.Border.all(1, self._palette.border),
+            content=ft.Row(
+                spacing=8,
+                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                controls=[
+                    self._gps_icon,
+                    self._gps_spinner,
+                    self.gps_status_text,
+                    self.refresh_gps_btn,
+                ],
+            ),
+        )
+
         form_body = ft.Column(
             spacing=14,
             scroll=ft.ScrollMode.AUTO,
@@ -297,6 +337,7 @@ class ViolationRegistrationPanel(ft.Container):
                         self.plate_input,
                     ],
                 ),
+                self._gps_card,
                 ft.Row(controls=[self.violation_dropdown]),
                 ft.Row(controls=[self.notes_field]),
                 self._crop_card,
@@ -333,15 +374,65 @@ class ViolationRegistrationPanel(ft.Container):
         self.bgcolor = self._palette.page_bg
         self.datetime_badge.color = self._palette.accent_text
         self._evidence_icon.color = self._palette.accent_text
+        self._gps_icon.color = self._palette.accent_text
         self._plate_label.color = self._palette.text_secondary
         self.evidence_card.bgcolor = self._palette.card_bg
         self.evidence_card.border = ft.Border.all(1, self._palette.border)
         self._crop_card.bgcolor = self._palette.card_bg
         self._crop_card.border = ft.Border.all(1, self._palette.border)
+        self._gps_card.bgcolor = self._palette.card_bg
+        self._gps_card.border = ft.Border.all(1, self._palette.border)
         self._header_bar.border = ft.Border.only(bottom=ft.BorderSide(1, self._palette.border))
         self._footer_actions.border = ft.Border.only(top=ft.BorderSide(1, self._palette.border))
         if not self._evidence_bytes:
             self.evidence_status_text.color = self._palette.text_muted
+        if self._gps_lat is None or self._gps_lon is None:
+            self.gps_status_text.color = self._palette.text_secondary
+        else:
+            self.gps_status_text.color = (
+                ft.Colors.GREEN_300 if dark_mode else ft.Colors.GREEN_700
+            )
+
+    def set_gps_loading(self, message: str = "در حال دریافت موقعیت مکانی (GPS)...") -> None:
+        self._gps_spinner.visible = True
+        self.gps_status_text.value = message
+        self.gps_status_text.color = self._palette.text_secondary
+
+    def set_gps_location(
+        self,
+        latitude: float | None,
+        longitude: float | None,
+        accuracy_m: float | None = None,
+        error_note: str = "",
+    ) -> None:
+        """مختصات دریافتی GPS را در کارت موقعیت مکانی ثبت و نمایش می‌دهد."""
+        self._gps_spinner.visible = False
+        self._gps_lat = latitude
+        self._gps_lon = longitude
+        self._gps_accuracy = accuracy_m
+
+        if latitude is not None and longitude is not None:
+            coords = f"{latitude:.6f}, {longitude:.6f}"
+            if accuracy_m is not None and accuracy_m > 0:
+                acc_fa = to_persian_digits(str(int(round(accuracy_m))))
+                self.gps_status_text.value = f"موقعیت GPS ثبت شد: {coords} (دقت ±{acc_fa} متر)"
+            else:
+                self.gps_status_text.value = f"موقعیت GPS ثبت شد: {coords}"
+            self.gps_status_text.color = (
+                ft.Colors.GREEN_300 if self._palette.dark_mode else ft.Colors.GREEN_700
+            )
+            self._gps_icon.color = ft.Colors.GREEN_400 if self._palette.dark_mode else ft.Colors.GREEN_700
+        else:
+            self.gps_status_text.value = error_note or "موقعیت GPS در دسترس نیست (بدون GPS نیز قابل ثبت است)"
+            self.gps_status_text.color = ft.Colors.AMBER_400 if self._palette.dark_mode else ft.Colors.ORANGE_800
+            self._gps_icon.color = self._palette.accent_text
+
+    async def _handle_refresh_gps_click(self, _e=None) -> None:
+        if self._on_refresh_gps is None or self._submitting:
+            return
+        self.set_gps_loading("در حال بروزرسانی مختصات GPS...")
+        self.update()
+        await self._on_refresh_gps()
 
     def prepare(
         self,
@@ -349,8 +440,9 @@ class ViolationRegistrationPanel(ft.Container):
         has_crop: bool,
         plate_crop_bytes: bytes | None = None,
         chars_persian: list[str] | None = None,
+        gps_coords: tuple[float, float, float | None] | None = None,
     ) -> None:
-        """فرم را با اطلاعات آخرین پلاک و تاریخ شمسی فعلی آماده و عکس مستندات قبلی را پاک می‌کند."""
+        """فرم را با اطلاعات آخرین پلاک، تاریخ شمسی و موقعیت GPS آماده و عکس مستندات قبلی را پاک می‌کند."""
         now_ir = now_iran_datetime()
         j_date = format_jalali_date(now_ir, persian_digits=True)
         j_time = format_jalali_time(now_ir, persian_digits=True)
@@ -360,6 +452,14 @@ class ViolationRegistrationPanel(ft.Container):
         self.notes_field.value = ""
         self.attach_crop_checkbox.value = has_crop
         self.attach_crop_checkbox.disabled = not has_crop
+
+        if gps_coords is not None:
+            self.set_gps_location(gps_coords[0], gps_coords[1], gps_coords[2])
+        else:
+            self._gps_lat = None
+            self._gps_lon = None
+            self._gps_accuracy = None
+            self.set_gps_loading()
 
         if has_crop and plate_crop_bytes:
             self.plate_crop_preview_holder.content = ft.Image(
@@ -485,6 +585,9 @@ class ViolationRegistrationPanel(ft.Container):
                 self.notes_field.value or "",
                 bool(self.attach_crop_checkbox.value),
                 self._evidence_bytes,
+                self._gps_lat,
+                self._gps_lon,
+                self._gps_accuracy,
             )
         finally:
             self.set_busy(False)

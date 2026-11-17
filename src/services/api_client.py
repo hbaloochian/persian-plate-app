@@ -16,7 +16,12 @@ from typing import Any
 
 import httpx
 
-from config import AppSettings, get_writable_data_dir, to_persian_digits
+from config import (
+    AppSettings,
+    get_writable_data_dir,
+    to_latin_digits,
+    to_persian_digits,
+)
 from core.jalali import (
     format_jalali_date,
     format_jalali_time,
@@ -80,12 +85,36 @@ class ViolationRecord:
     jalali_date: str = ""
     jalali_time: str = ""
     jalali_weekday: str = ""
+    latitude: float | None = None
+    longitude: float | None = None
+    location_accuracy_m: float | None = None
     has_image: bool = False
     has_evidence_image: bool = False
     plate_image_file: str | None = None
     evidence_image_file: str | None = None
     synced: bool = False
     server_response: str = ""
+
+    @property
+    def has_gps(self) -> bool:
+        return self.latitude is not None and self.longitude is not None
+
+    @property
+    def formatted_gps(self) -> str:
+        """نمایش خوانای مختصات جغرافیایی (مثال: 35.689200, 51.389000 (±12m))."""
+        if not self.has_gps:
+            return "ثبت نشده"
+        base = f"{self.latitude:.6f}, {self.longitude:.6f}"
+        if self.location_accuracy_m is not None and self.location_accuracy_m > 0:
+            return f"{base} (±{int(round(self.location_accuracy_m))}m)"
+        return base
+
+    @property
+    def google_maps_url(self) -> str:
+        """لینک مستقیم نمایش موقعیت تخلف روی نقشه."""
+        if not self.has_gps:
+            return ""
+        return f"https://maps.google.com/?q={self.latitude:.6f},{self.longitude:.6f}"
 
     @property
     def display_jalali_datetime(self) -> str:
@@ -117,6 +146,14 @@ class ViolationRecord:
             elif raw_ts:
                 local_time = raw_ts.replace("T", " ")[:19]
 
+        def _parse_float(val: Any) -> float | None:
+            if val is None or val == "":
+                return None
+            try:
+                return float(val)
+            except (TypeError, ValueError):
+                return None
+
         return cls(
             id=str(data.get("id") or f"legacy-{fallback_index}"),
             plate=str(data.get("plate") or "---"),
@@ -128,6 +165,9 @@ class ViolationRecord:
             jalali_date=jalali_date,
             jalali_time=jalali_time,
             jalali_weekday=jalali_weekday,
+            latitude=_parse_float(data.get("latitude")),
+            longitude=_parse_float(data.get("longitude")),
+            location_accuracy_m=_parse_float(data.get("location_accuracy_m")),
             has_image=bool(data.get("has_image", False)),
             has_evidence_image=bool(data.get("has_evidence_image", False)),
             plate_image_file=(
@@ -466,8 +506,11 @@ class PlateApiClient:
         description: str,
         plate_crop_jpeg: bytes | None = None,
         evidence_image_jpeg: bytes | None = None,
+        latitude: float | None = None,
+        longitude: float | None = None,
+        location_accuracy_m: float | None = None,
     ) -> ViolationSubmissionResult:
-        """گزارش تخلف (همراه با تاریخ شمسی، ساعت، تصویر برش پلاک و تصویر مستندات) را به سرور ارسال و محلی ذخیره می‌کند."""
+        """گزارش تخلف (همراه با تاریخ شمسی، ساعت، موقعیت GPS و تصاویر) را به سرور ارسال و محلی ذخیره می‌کند."""
         now_ir = now_iran_datetime()
         jalali_date = format_jalali_date(now_ir, persian_digits=False)
         jalali_time = format_jalali_time(now_ir, persian_digits=False)
@@ -495,6 +538,9 @@ class PlateApiClient:
             "jalali_time": jalali_time,
             "jalali_datetime": jalali_datetime,
             "jalali_weekday": jalali_weekday,
+            "latitude": latitude,
+            "longitude": longitude,
+            "location_accuracy_m": location_accuracy_m,
             "has_image": plate_crop_jpeg is not None,
             "has_evidence_image": evidence_image_jpeg is not None,
         }
@@ -531,6 +577,9 @@ class PlateApiClient:
             jalali_date=jalali_date,
             jalali_time=jalali_time,
             jalali_weekday=jalali_weekday,
+            latitude=latitude,
+            longitude=longitude,
+            location_accuracy_m=location_accuracy_m,
             has_image=plate_crop_jpeg is not None,
             has_evidence_image=evidence_image_jpeg is not None,
             plate_image_file=plate_img_file,
@@ -564,6 +613,9 @@ class PlateApiClient:
             "jalali_time": record.jalali_time,
             "jalali_datetime": f"{record.jalali_date} {record.jalali_time}".strip(),
             "jalali_weekday": record.jalali_weekday,
+            "latitude": record.latitude,
+            "longitude": record.longitude,
+            "location_accuracy_m": record.location_accuracy_m,
             "has_image": plate_bytes is not None,
             "has_evidence_image": evidence_bytes is not None,
         }
@@ -616,3 +668,68 @@ class PlateApiClient:
     async def close(self) -> None:
         if self._client is not None and not self._client.is_closed:
             await self._client.aclose()
+
+
+def _normalize_search_text(text: str) -> str:
+    """نرمال‌سازی متن فارسی/انگلیسی و ارقام برای جستجوی بدون خطا در تخلفات."""
+    normalized = to_latin_digits(text or "").strip().lower()
+    return (
+        normalized.replace("ي", "ی")
+        .replace("ك", "ک")
+        .replace("‌", " ")
+    )
+
+
+def filter_violation_records(
+    records: list[ViolationRecord],
+    *,
+    search_query: str = "",
+    sync_filter: str = "all",
+    violation_type: str = "",
+) -> list[ViolationRecord]:
+    """
+    فیلتر و جستجوی لیست تخلفات ثبت‌شده.
+
+    sync_filter:
+      - 'all': همه تخلفات
+      - 'synced': فقط ارسال‌شده‌ها به سرور
+      - 'pending': فقط در انتظار ارسال (ذخیره‌شده محلی)
+      - 'gps': فقط دارای موقعیت مکانی GPS
+    """
+    q = _normalize_search_text(search_query)
+    vtype_filter = (violation_type or "").strip()
+
+    result: list[ViolationRecord] = []
+    for rec in records:
+        if sync_filter == "synced" and not rec.synced:
+            continue
+        if sync_filter == "pending" and rec.synced:
+            continue
+        if sync_filter == "gps" and not rec.has_gps:
+            continue
+        if vtype_filter and vtype_filter != "همه" and rec.violation_type != vtype_filter:
+            continue
+
+        if q:
+            haystack = _normalize_search_text(
+                " ".join(
+                    [
+                        rec.plate,
+                        rec.plate_latin,
+                        rec.violation_type,
+                        rec.description,
+                        rec.jalali_date,
+                        rec.jalali_time,
+                        rec.jalali_weekday,
+                        rec.formatted_gps if rec.has_gps else "",
+                        rec.id,
+                    ]
+                )
+            )
+            # جستجوی چندکلمه‌ای: تمام کلمات واردشده باید در رکورد وجود داشته باشند
+            if not all(token in haystack for token in q.split()):
+                continue
+
+        result.append(rec)
+
+    return result

@@ -30,6 +30,11 @@ try:
 except ImportError:  # pragma: no cover - در محیط‌های تست بدون بسته محلی
     fla = None
 
+try:
+    import flet_geolocator as ftg
+except ImportError:  # pragma: no cover - در محیط‌های تست بدون بسته محلی
+    ftg = None
+
 # اطمینان از در دسترس بودن ماژول‌های داخل پوشه src در همه محیط‌های اجرا
 SRC_DIR = Path(__file__).resolve().parent
 if str(SRC_DIR) not in sys.path:
@@ -38,6 +43,7 @@ if str(SRC_DIR) not in sys.path:
 from config import load_settings, save_settings, should_query_plate, to_persian_digits
 from core.geometry import compute_android_rotation_degrees, rotate_pil_clockwise
 from core.plate_detector import FrameInferenceResult, PersianPlateEngine, PlateDetection
+from core.plate_stabilizer import MultiFramePlateStabilizer, StabilizedPlateResult
 from services.api_client import (
     ApiCheckResult,
     PlateApiClient,
@@ -48,7 +54,10 @@ from services.api_client import (
     read_violation_image_bytes,
 )
 from services.pdf_report import (
+    build_batch_export_filename,
     build_violation_pdf_filename,
+    generate_batch_violations_csv_bytes,
+    generate_batch_violations_pdf_bytes,
     generate_violation_pdf_bytes,
     save_pdf_backup_in_app_storage,
     try_write_pdf_to_downloads,
@@ -96,11 +105,17 @@ class AppRuntimeState:
     last_raw_frame_bytes: bytes | None = None
     last_raw_frame_rotation: int = 0
 
-    # آخرین تشخیص‌ها و وضعیت سرور برای هر پلاک
+    # آخرین تشخیص‌ها، نتیجه تثبیت چندفریمی و وضعیت سرور برای هر پلاک
     active_plates: list[PlateDetection] = field(default_factory=list)
     plate_statuses: dict[str, PlateCheckStatus] = field(default_factory=dict)
+    inflight_queries: set[str] = field(default_factory=set)
     selected_plate: PlateDetection | None = None
+    last_stabilized: StabilizedPlateResult | None = None
     last_api_result: ApiCheckResult | None = None
+
+    # آخرین موقعیت مکانی دریافتی GPS: (lat, lon, accuracy_m)
+    last_gps: tuple[float, float, float | None] | None = None
+    last_gps_ts: float = 0.0
 
     # حالت فعلی نمایش برنامه: "info" | "violation" | "history" | "evidence_camera"
     screen_mode: str = "info"
@@ -162,14 +177,31 @@ async def main(page: ft.Page) -> None:
 
     state = AppRuntimeState()
     engine = PersianPlateEngine(settings=settings)
+    plate_stabilizer = MultiFramePlateStabilizer(
+        window_size=5,
+        min_confirmations=2,
+        max_age_sec=3.5,
+    )
     api_client = PlateApiClient(settings=settings)
     permission_handler = fph.PermissionHandler()
     file_picker = ft.FilePicker()
     local_auth = fla.LocalAuthentication() if fla is not None else None
+    geolocator = (
+        ftg.Geolocator(
+            configuration=ftg.GeolocatorConfiguration(
+                accuracy=ftg.GeolocatorPositionAccuracy.HIGH,
+                time_limit=ft.Duration(seconds=10),
+            )
+        )
+        if ftg is not None
+        else None
+    )
     if hasattr(page, "services"):
         page.services.append(file_picker)
         if local_auth is not None:
             page.services.append(local_auth)
+        if geolocator is not None:
+            page.services.append(geolocator)
 
     # -----------------------------------------------------------------------
     # کنترل‌های بخش بالای صفحه (دوربین زنده + کادرهای Canvas + نوار HUD)
@@ -644,17 +676,34 @@ async def main(page: ft.Page) -> None:
             _info_row("پلاک تشخیص‌داده‌شده", plate.display_text),
             _info_row("کد لاتین ارسالی به سرور", plate.plate_latin or "---"),
             _info_row("دقت مدل محلی", to_persian_digits(f"{int(plate.confidence * 100)}٪")),
-            _info_row(
-                "حالت استعلام",
-                "خودکار" if settings.auto_query_enabled else "دستی (با دکمه استعلام پلاک)",
-                value_color=p.accent_text,
-            ),
-            _info_row(
-                "نوع پلاک مجاز استعلام",
-                "تمام پلاک‌ها" if settings.query_all_plates else "فقط پلاک‌های عمومی (ع)",
-                value_color=p.accent_text,
-            ),
         ]
+        if state.last_stabilized is not None:
+            stab_color = (
+                (ft.Colors.GREEN_400 if p.dark_mode else ft.Colors.GREEN_700)
+                if state.last_stabilized.is_confirmed
+                else (ft.Colors.AMBER_300 if p.dark_mode else ft.Colors.ORANGE_800)
+            )
+            rows.append(
+                _info_row(
+                    "تثبیت چندفریمی",
+                    state.last_stabilized.status_badge_text(),
+                    value_color=stab_color,
+                )
+            )
+        rows.extend(
+            [
+                _info_row(
+                    "حالت استعلام",
+                    "خودکار" if settings.auto_query_enabled else "دستی (با دکمه استعلام پلاک)",
+                    value_color=p.accent_text,
+                ),
+                _info_row(
+                    "نوع پلاک مجاز استعلام",
+                    "تمام پلاک‌ها" if settings.query_all_plates else "فقط پلاک‌های عمومی (ع)",
+                    value_color=p.accent_text,
+                ),
+            ]
+        )
 
         if api_res is not None:
             rows.append(ft.Divider(height=8, color=p.border))
@@ -705,6 +754,97 @@ async def main(page: ft.Page) -> None:
         refresh_overlay_boxes()
         page.update()
 
+    # -----------------------------------------------------------------------
+    # دریافت خودکار موقعیت مکانی (GPS) گوشی با flet-geolocator
+    # -----------------------------------------------------------------------
+    async def fetch_current_gps(*, request_if_needed: bool = True) -> tuple[tuple[float, float, float | None] | None, str]:
+        """مختصات جغرافیایی فعلی گوشی (lat, lon, accuracy_m) را بدون قفل کردن رابط کاربری دریافت می‌کند."""
+        if geolocator is None or ftg is None:
+            return state.last_gps, "سرویس GPS در این محیط در دسترس نیست."
+
+        if page.platform == ft.PagePlatform.LINUX and not page.web:
+            return state.last_gps, "سنسور GPS روی نسخه اندروید گوشی فعال است."
+
+        try:
+            service_on = await asyncio.wait_for(geolocator.is_location_service_enabled(), timeout=5.0)
+            if not service_on:
+                return state.last_gps, "سرویس موقعیت مکانی (Location/GPS) گوشی خاموش است."
+
+            perm = await asyncio.wait_for(geolocator.get_permission_status(), timeout=5.0)
+            granted_states = (
+                ftg.GeolocatorPermissionStatus.WHILE_IN_USE,
+                ftg.GeolocatorPermissionStatus.ALWAYS,
+            )
+            if perm not in granted_states:
+                if not request_if_needed or perm == ftg.GeolocatorPermissionStatus.DENIED_FOREVER:
+                    return state.last_gps, "مجوز دسترسی به موقعیت مکانی (GPS) صادر نشده است."
+                perm = await asyncio.wait_for(geolocator.request_permission(), timeout=15.0)
+                if perm not in granted_states:
+                    return state.last_gps, "دسترسی به GPS توسط کاربر تأیید نشد."
+
+            # مرحله اول: دریافت فوری آخرین موقعیت کش‌شده دستگاه (کمتر از ۵۰ میلی‌ثانیه)
+            cached_pos = None
+            if not page.web:
+                try:
+                    cached_pos = await asyncio.wait_for(geolocator.get_last_known_position(), timeout=3.0)
+                except Exception:
+                    cached_pos = None
+            if cached_pos is not None and cached_pos.latitude is not None and cached_pos.longitude is not None:
+                state.last_gps = (
+                    float(cached_pos.latitude),
+                    float(cached_pos.longitude),
+                    float(cached_pos.accuracy) if cached_pos.accuracy else None,
+                )
+                state.last_gps_ts = time.monotonic()
+                if state.screen_mode == "violation":
+                    violation_panel.set_gps_location(*state.last_gps)
+                    try:
+                        violation_panel.update()
+                    except Exception:
+                        pass
+
+            # مرحله دوم: دریافت موقعیت دقیق و لحظه‌ای از GPS
+            pos = await asyncio.wait_for(
+                geolocator.get_current_position(
+                    configuration=ftg.GeolocatorConfiguration(
+                        accuracy=ftg.GeolocatorPositionAccuracy.HIGH,
+                        time_limit=ft.Duration(seconds=10),
+                    )
+                ),
+                timeout=12.0,
+            )
+            if pos is not None and pos.latitude is not None and pos.longitude is not None:
+                coords = (
+                    float(pos.latitude),
+                    float(pos.longitude),
+                    float(pos.accuracy) if pos.accuracy else None,
+                )
+                state.last_gps = coords
+                state.last_gps_ts = time.monotonic()
+                return coords, ""
+            return state.last_gps, "مختصات دقیقی از ماهواره GPS دریافت نشد."
+        except asyncio.TimeoutError:
+            if state.last_gps is not None:
+                return state.last_gps, ""
+            return None, "زمان دریافت سیگنال GPS به پایان رسید (در فضای باز مجدد تلاش کنید)."
+        except Exception as exc:
+            logger.warning("GPS fetch error: %s", exc)
+            if state.last_gps is not None:
+                return state.last_gps, ""
+            return None, f"خطا در دریافت GPS: {exc}"
+
+    async def refresh_violation_panel_gps() -> None:
+        coords, err = await fetch_current_gps(request_if_needed=True)
+        if state.screen_mode == "violation":
+            if coords is not None:
+                violation_panel.set_gps_location(coords[0], coords[1], coords[2])
+            else:
+                violation_panel.set_gps_location(None, None, None, error_note=err)
+            try:
+                violation_panel.update()
+            except Exception:
+                pass
+
     def switch_to_violation_view(_e=None) -> None:
         state.screen_mode = "violation"
         plate_text = state.selected_plate.display_text if state.selected_plate else ""
@@ -718,16 +858,24 @@ async def main(page: ft.Page) -> None:
             if state.selected_plate is not None
             else None
         )
+        # استفاده فوری از آخرین GPS کش‌شده (در صورت تازگی زیر ۵ دقیقه) و بروزرسانی همزمان در پس‌زمینه
+        fresh_cached_gps = (
+            state.last_gps
+            if (state.last_gps is not None and (time.monotonic() - state.last_gps_ts) < 300.0)
+            else None
+        )
         violation_panel.prepare(
             plate_display=plate_text,
             has_crop=crop_bytes is not None,
             plate_crop_bytes=crop_bytes,
             chars_persian=plate_chars,
+            gps_coords=fresh_cached_gps,
         )
         fullscreen_overlay.content = violation_panel
         fullscreen_overlay.visible = True
         evidence_capture_overlay.visible = False
         page.update()
+        asyncio.create_task(refresh_violation_panel_gps())
 
     async def switch_to_history_view(_e=None) -> None:
         state.screen_mode = "history"
@@ -879,6 +1027,9 @@ async def main(page: ft.Page) -> None:
         notes: str,
         attach_crop: bool,
         evidence_bytes: bytes | None,
+        latitude: float | None = None,
+        longitude: float | None = None,
+        location_accuracy_m: float | None = None,
     ) -> None:
         final_latin = plate_latin or (state.selected_plate.plate_latin if state.selected_plate else "")
         crop_bytes = (
@@ -886,6 +1037,10 @@ async def main(page: ft.Page) -> None:
             if (attach_crop and state.selected_plate is not None)
             else None
         )
+        # اگر در لحظه ثبت GPS هنوز روی فرم نیامده ولی آخرین موقعیت کش‌شده موجود است
+        if latitude is None and longitude is None and state.last_gps is not None:
+            latitude, longitude, location_accuracy_m = state.last_gps
+
         result = await api_client.submit_violation(
             plate_persian=plate_text,
             plate_latin=final_latin,
@@ -893,6 +1048,9 @@ async def main(page: ft.Page) -> None:
             description=notes,
             plate_crop_jpeg=crop_bytes,
             evidence_image_jpeg=evidence_bytes,
+            latitude=latitude,
+            longitude=longitude,
+            location_accuracy_m=location_accuracy_m,
         )
         await refresh_violation_counter(update_ui=False)
         show_snackbar(result.message, is_error=not result.success)
@@ -900,10 +1058,56 @@ async def main(page: ft.Page) -> None:
             switch_to_info_view()
 
     # -----------------------------------------------------------------------
+    # ابزار مشترک ذخیره فایل‌های گزارش (PDF و CSV) در پوشه Downloads گوشی
+    # -----------------------------------------------------------------------
+    async def _save_exported_file_to_downloads(
+        file_bytes: bytes,
+        filename: str,
+        extension: str,
+        dialog_title: str,
+    ) -> None:
+        backup_path = await asyncio.to_thread(
+            save_pdf_backup_in_app_storage,
+            file_bytes,
+            filename,
+        )
+        wrote_direct, saved_path, _err = await asyncio.to_thread(
+            try_write_pdf_to_downloads,
+            file_bytes,
+            filename,
+        )
+        if wrote_direct and saved_path is not None:
+            show_snackbar(f"فایل «{filename}» با موفقیت در پوشه Downloads ذخیره شد.")
+            return
+
+        try:
+            saved_uri = await file_picker.save_file(
+                dialog_title=dialog_title,
+                file_name=filename,
+                initial_directory="/storage/emulated/0/Download",
+                file_type=ft.FilePickerFileType.CUSTOM,
+                allowed_extensions=[extension],
+                src_bytes=file_bytes,
+            )
+            if saved_uri:
+                show_snackbar(f"فایل «{filename}» با موفقیت ذخیره شد.")
+            else:
+                show_snackbar(
+                    f"ذخیره در Downloads لغو شد (نسخه پشتیبان در {backup_path.name} موجود است).",
+                    is_error=True,
+                )
+        except Exception as picker_exc:
+            logger.warning("SAF save_file error: %s", picker_exc)
+            show_snackbar(
+                f"گزارش در حافظه برنامه ذخیره شد: {backup_path}",
+                is_error=False,
+            )
+
+    # -----------------------------------------------------------------------
     # پنجره جزئیات تخلف (تمامی دکمه‌ها در یک ردیف + دکمه «گزارش» PDF در پوشه دانلود)
     # -----------------------------------------------------------------------
     async def open_violation_detail_dialog(record: ViolationRecord) -> None:
-        """نمایش جزئیات کامل تخلف با تاریخ شمسی، تصاویر، دکمه‌های تک‌ردیفه و خروجی PDF."""
+        """نمایش جزئیات کامل تخلف با تاریخ شمسی، موقعیت GPS، تصاویر، دکمه‌های تک‌ردیفه و خروجی PDF."""
         plate_bytes = await asyncio.to_thread(read_violation_image_bytes, record.plate_image_file)
         evidence_bytes = await asyncio.to_thread(
             read_violation_image_bytes,
@@ -926,11 +1130,20 @@ async def main(page: ft.Page) -> None:
             _info_row("تاریخ شمسی", jalali_date_str, value_color=p.accent_text),
             _info_row("ساعت ثبت", jalali_time_str, value_color=p.accent_text),
             _info_row(
+                "موقعیت مکانی (GPS)",
+                record.formatted_gps,
+                value_color=synced_color if record.has_gps else p.text_muted,
+            ),
+            _info_row(
                 "وضعیت ارسال",
                 "ارسال‌شده به سرور" if record.synced else "ذخیره‌شده روی گوشی (ارسال‌نشده)",
                 value_color=synced_color if record.synced else unsynced_color,
             ),
         ]
+        if record.has_gps:
+            detail_controls.append(
+                _info_row("لینک نقشه", record.google_maps_url, value_color=p.accent_text)
+            )
         if record.description:
             detail_controls.append(_info_row("توضیحات", record.description))
         if record.server_response:
@@ -1001,50 +1214,12 @@ async def main(page: ft.Page) -> None:
                     plate_bytes,
                     evidence_bytes,
                 )
-                # ذخیره همیشگی یک نسخه پشتیبان مطمئن در حافظه داخلی برنامه
-                backup_path = await asyncio.to_thread(
-                    save_pdf_backup_in_app_storage,
+                await _save_exported_file_to_downloads(
                     pdf_bytes,
                     filename,
+                    "pdf",
+                    "ذخیره گزارش PDF تخلف در پوشه دانلود",
                 )
-
-                # تلاش اول: نوشتن مستقیم در پوشه Downloads
-                wrote_direct, saved_path, _err = await asyncio.to_thread(
-                    try_write_pdf_to_downloads,
-                    pdf_bytes,
-                    filename,
-                )
-                if wrote_direct and saved_path is not None:
-                    show_snackbar(
-                        f"گزارش PDF با نام «{filename}» در پوشه Downloads ذخیره شد."
-                    )
-                    return
-
-                # تلاش دوم (اندروید ۱۰ تا ۱۵ با Scoped Storage): ذخیره امن در پوشه Download از طریق SAF
-                try:
-                    saved_uri = await file_picker.save_file(
-                        dialog_title="ذخیره گزارش PDF تخلف در پوشه دانلود",
-                        file_name=filename,
-                        initial_directory="/storage/emulated/0/Download",
-                        file_type=ft.FilePickerFileType.CUSTOM,
-                        allowed_extensions=["pdf"],
-                        src_bytes=pdf_bytes,
-                    )
-                    if saved_uri:
-                        show_snackbar(
-                            f"گزارش PDF با نام «{filename}» با موفقیت ذخیره شد."
-                        )
-                    else:
-                        show_snackbar(
-                            f"ذخیره در Downloads لغو شد (نسخه پشتیبان در {backup_path.name} موجود است).",
-                            is_error=True,
-                        )
-                except Exception as picker_exc:
-                    logger.warning("SAF save_file error: %s", picker_exc)
-                    show_snackbar(
-                        f"گزارش در حافظه برنامه ذخیره شد: {backup_path}",
-                        is_error=False,
-                    )
             except Exception as exc:
                 logger.exception("PDF report export failed")
                 show_snackbar(f"خطا در ساخت گزارش PDF: {exc}", is_error=True)
@@ -1199,18 +1374,118 @@ async def main(page: ft.Page) -> None:
             )
         )
 
+    # -----------------------------------------------------------------------
+    # عملیات گروهی صفحه بازبینی تخلفات (ارسال یکجا + PDF گروهی + اکسل CSV)
+    # -----------------------------------------------------------------------
+    async def handle_sync_all_violations(pending_records: list[ViolationRecord]) -> None:
+        total = len(pending_records)
+        if total == 0:
+            show_snackbar("همه تخلفات این فهرست قبلاً ارسال شده‌اند.")
+            return
+
+        sent_ok = 0
+        failed = 0
+        violation_history_panel.set_batch_busy(
+            True,
+            f"در حال ارسال ۱ از {to_persian_digits(str(total))}...",
+        )
+        violation_history_panel.update()
+        try:
+            for idx, rec in enumerate(pending_records, start=1):
+                violation_history_panel.set_batch_busy(
+                    True,
+                    f"در حال ارسال {to_persian_digits(str(idx))} از {to_persian_digits(str(total))}...",
+                )
+                violation_history_panel.update()
+                res = await api_client.retry_violation_sync(rec)
+                if res.success:
+                    sent_ok += 1
+                else:
+                    failed += 1
+        finally:
+            violation_history_panel.set_batch_busy(False, "")
+            await reload_history_panel()
+
+        if failed == 0:
+            show_snackbar(
+                f"همه {to_persian_digits(str(sent_ok))} تخلف با موفقیت به سرور ارسال شدند."
+            )
+        else:
+            show_snackbar(
+                f"ارسال یکجا تمام شد: {to_persian_digits(str(sent_ok))} موفق، {to_persian_digits(str(failed))} ناموفق.",
+                is_error=sent_ok == 0,
+            )
+
+    async def handle_export_batch_pdf(records: list[ViolationRecord], filter_summary: str) -> None:
+        if not records:
+            show_snackbar("تخلفی برای خروجی PDF گروهی وجود ندارد.", is_error=True)
+            return
+        violation_history_panel.set_batch_busy(True, "در حال ساخت گزارش PDF گروهی...")
+        violation_history_panel.update()
+        try:
+            filename = build_batch_export_filename("pdf")
+            pdf_bytes = await asyncio.to_thread(
+                generate_batch_violations_pdf_bytes,
+                records,
+                filter_summary=filter_summary,
+            )
+            await _save_exported_file_to_downloads(
+                pdf_bytes,
+                filename,
+                "pdf",
+                "ذخیره گزارش PDF گروهی تخلفات در پوشه دانلود",
+            )
+        except Exception as exc:
+            logger.exception("Batch PDF export failed")
+            show_snackbar(f"خطا در ساخت PDF گروهی: {exc}", is_error=True)
+        finally:
+            violation_history_panel.set_batch_busy(False, "")
+            try:
+                violation_history_panel.update()
+            except Exception:
+                pass
+
+    async def handle_export_batch_csv(records: list[ViolationRecord]) -> None:
+        if not records:
+            show_snackbar("تخلفی برای خروجی اکسل CSV وجود ندارد.", is_error=True)
+            return
+        violation_history_panel.set_batch_busy(True, "در حال ساخت فایل اکسل (CSV)...")
+        violation_history_panel.update()
+        try:
+            filename = build_batch_export_filename("csv", prefix="تخلفات-ثبت-شده")
+            csv_bytes = await asyncio.to_thread(generate_batch_violations_csv_bytes, records)
+            await _save_exported_file_to_downloads(
+                csv_bytes,
+                filename,
+                "csv",
+                "ذخیره فایل اکسل CSV تخلفات در پوشه دانلود",
+            )
+        except Exception as exc:
+            logger.exception("Batch CSV export failed")
+            show_snackbar(f"خطا در ساخت فایل CSV: {exc}", is_error=True)
+        finally:
+            violation_history_panel.set_batch_busy(False, "")
+            try:
+                violation_history_panel.update()
+            except Exception:
+                pass
+
     violation_panel = ViolationRegistrationPanel(
         page=page,
         on_back=switch_to_info_view,
         on_submit=handle_violation_submit,
         on_capture_evidence=handle_capture_evidence_photo,
         on_pick_evidence=handle_pick_evidence_photo,
+        on_refresh_gps=refresh_violation_panel_gps,
         dark_mode=settings.dark_mode,
     )
     violation_history_panel = ViolationHistoryPanel(
         on_back=switch_to_info_view,
         on_refresh=reload_history_panel,
         on_select_record=open_violation_detail_dialog,
+        on_sync_all=handle_sync_all_violations,
+        on_export_batch_pdf=handle_export_batch_pdf,
+        on_export_batch_csv=handle_export_batch_csv,
         dark_mode=settings.dark_mode,
     )
 
@@ -1367,25 +1642,31 @@ async def main(page: ft.Page) -> None:
         plate_key = plate.plate_latin or plate.plate_persian
         if not plate_key:
             return None
+        if not force_refresh and plate_key in state.inflight_queries:
+            return None
 
-        result = await api_client.check_plate(
-            plate_persian=plate.plate_persian,
-            plate_latin=plate.plate_latin,
-            confidence=plate.confidence,
-            force_refresh=force_refresh,
-        )
-        state.plate_statuses[plate_key] = result.status
+        state.inflight_queries.add(plate_key)
+        try:
+            result = await api_client.check_plate(
+                plate_persian=plate.plate_persian,
+                plate_latin=plate.plate_latin,
+                confidence=plate.confidence,
+                force_refresh=force_refresh,
+            )
+            state.plate_statuses[plate_key] = result.status
 
-        if state.selected_plate is not None:
-            selected_key = state.selected_plate.plate_latin or state.selected_plate.plate_persian
-            if selected_key == plate_key:
-                state.last_api_result = result
-                if state.screen_mode == "info":
-                    render_server_info_panel()
-                    bottom_section_container.update()
+            if state.selected_plate is not None:
+                selected_key = state.selected_plate.plate_latin or state.selected_plate.plate_persian
+                if selected_key == plate_key:
+                    state.last_api_result = result
+                    if state.screen_mode == "info":
+                        render_server_info_panel()
+                        bottom_section_container.update()
 
-        refresh_overlay_boxes()
-        return result
+            refresh_overlay_boxes()
+            return result
+        finally:
+            state.inflight_queries.discard(plate_key)
 
     async def handle_manual_query_click(_e=None) -> None:
         """ارسال دستی پلاک شناسایی‌شده به سرور هنگام فشردن دکمه «استعلام پلاک»."""
@@ -1465,10 +1746,28 @@ async def main(page: ft.Page) -> None:
             hud_fps_text.value = to_persian_digits(f"{state.fps:.1f} FPS ({int(result.inference_ms)}ms)")
             hud_fps_text.update()
 
+            # اعمال فیلتر تثبیت چندفریمی (Multi-Frame Consensus) روی پلاک اصلی
+            stabilized_primary: StabilizedPlateResult | None = None
+            if result.plates:
+                primary = result.plates[0]
+                if not engine.single_stage_mode and primary.complete and len(primary.chars_persian) == 8:
+                    stabilized_primary = plate_stabilizer.update(
+                        primary.chars_persian,
+                        primary.confidence,
+                    )
+                    if stabilized_primary is not None:
+                        primary.chars_persian = list(stabilized_primary.chars_persian)
+                        primary.plate_persian = stabilized_primary.plate_persian
+                        primary.plate_latin = stabilized_primary.plate_latin
+                        primary.confidence = stabilized_primary.confidence
+                        state.last_stabilized = stabilized_primary
+                else:
+                    state.last_stabilized = None
+
             state.active_plates = result.plates
 
-            # ثبت رنگ آبی اولیه؛ ارسال خودکار فقط در صورت فعال بودن استعلام خودکار و تطابق با فیلتر پلاک
-            for plate in result.plates:
+            # ثبت رنگ آبی اولیه؛ ارسال خودکار فقط پس از تثبیت چندفریمی (Multi-Frame Consensus) و تطابق با فیلتر پلاک
+            for idx_p, plate in enumerate(result.plates):
                 plate_key = plate.plate_latin or plate.plate_persian
                 if not plate_key:
                     continue
@@ -1477,18 +1776,40 @@ async def main(page: ft.Page) -> None:
                     state.plate_statuses[plate_key] = PlateCheckStatus.PENDING
                     continue
 
+                # پلاک اصلی در حالت دومرحله‌ای تا تأیید چندفریمی نباید استعلام خودکار ارسال کند
+                confirmed_for_auto = True
+                if idx_p == 0 and not engine.single_stage_mode and stabilized_primary is not None:
+                    confirmed_for_auto = stabilized_primary.is_confirmed
+
                 cached = api_client.get_cached(plate_key)
                 if cached is not None:
                     state.plate_statuses[plate_key] = cached.status
                 elif plate_key not in state.plate_statuses:
                     state.plate_statuses[plate_key] = PlateCheckStatus.PENDING
-                    if settings.auto_query_enabled and should_query_plate(
+                    if (
+                        confirmed_for_auto
+                        and settings.auto_query_enabled
+                        and should_query_plate(
+                            settings,
+                            chars_persian=plate.chars_persian,
+                            plate_persian=plate.plate_persian,
+                            plate_latin=plate.plate_latin,
+                        )
+                    ):
+                        asyncio.create_task(query_plate_server(plate))
+                elif (
+                    confirmed_for_auto
+                    and plate_key not in state.inflight_queries
+                    and state.plate_statuses.get(plate_key) == PlateCheckStatus.PENDING
+                    and settings.auto_query_enabled
+                    and should_query_plate(
                         settings,
                         chars_persian=plate.chars_persian,
                         plate_persian=plate.plate_persian,
                         plate_latin=plate.plate_latin,
-                    ):
-                        asyncio.create_task(query_plate_server(plate))
+                    )
+                ):
+                    asyncio.create_task(query_plate_server(plate))
 
             # انتخاب اصلی‌ترین پلاک دیده‌شده برای نمایش در بخش پایین صفحه
             if result.plates:
@@ -1538,6 +1859,8 @@ async def main(page: ft.Page) -> None:
     # -----------------------------------------------------------------------
     def toggle_pause(_e=None) -> None:
         state.is_paused = not state.is_paused
+        if not state.is_paused:
+            plate_stabilizer.reset()
         pause_btn.icon = ft.Icons.PLAY_CIRCLE_OUTLINE if state.is_paused else ft.Icons.PAUSE_CIRCLE_OUTLINE
         hud_status_text.value = "اسکن متوقف شد" if state.is_paused else "در حال اسکن زنده..."
         pause_btn.update()
@@ -1564,6 +1887,9 @@ async def main(page: ft.Page) -> None:
     async def run_demo_detection(is_no: bool) -> None:
         demo_chars = ["1", "2", "ع", "3", "4", "5", "1", "1"]
         demo_crop = await asyncio.to_thread(_create_demo_jpeg, (235, 238, 245), (280, 72))
+        plate_stabilizer.reset()
+        plate_stabilizer.update(demo_chars, 0.92)
+        state.last_stabilized = plate_stabilizer.update(demo_chars, 0.96)
         demo_plate = PlateDetection(
             norm_box=(0.2, 0.38, 0.8, 0.56),
             pixel_box=(128, 180, 512, 270),
@@ -1685,6 +2011,9 @@ async def main(page: ft.Page) -> None:
             else:
                 hud_status_text.value = "استریم زنده روی این دوربین پشتیبانی نشد"
             page.update()
+
+            # پیش‌گرم‌سازی بی‌صدای GPS (فقط در صورت داشتن مجوز قبلی) برای آماده‌بودن فوری هنگام ثبت تخلف
+            asyncio.create_task(fetch_current_gps(request_if_needed=False))
         except Exception as exc:
             logger.exception("Camera initialization failed")
             camera_placeholder_text.value = f"خطا در راه‌اندازی دوربین:\n{exc}"
