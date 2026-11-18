@@ -829,16 +829,22 @@ async def main(page: ft.Page) -> None:
             if state.last_gps is not None:
                 return state.last_gps, ""
             return None, "مختصات دقیقی از ماهواره GPS دریافت نشد (در فضای باز مجدد تلاش کنید)."
-        except asyncio.TimeoutError:
+        except TimeoutError:
             # سقوط نرم: در صورت وجود آخرین موقعیت کش‌شده، بدون نمایش خطای timeout آن را نشان می‌دهیم
             if state.last_gps is not None:
                 return state.last_gps, ""
-            return None, "زمان دریافت سیگنال GPS به پایان رسید (در فضای باز مجدد تلاش کنید)."
+            return None, "مختصات دقیق لحظه‌ای دریافت نشد؛ در فضای باز و با سیگنال GPS قوی مجدد تلاش کنید."
         except Exception as exc:
             logger.warning("GPS fetch error: %s", exc)
             if state.last_gps is not None:
                 return state.last_gps, ""
-            return None, f"خطا در دریافت GPS: {exc}"
+            # نمایش پیام‌های دوست‌داشتنی فارسی به‌جای متن خطای سرویس (مثل «Location request timed out»)
+            msg = str(exc).lower()
+            if "timed out" in msg or "timeout" in msg:
+                return None, "مختصات دقیق لحظه‌ای دریافت نشد؛ در فضای باز و با سیگنال GPS قوی مجدد تلاش کنید."
+            if "permission" in msg or "denied" in msg:
+                return None, "مجوز دسترسی به موقعیت مکانی (GPS) صادر نشده است."
+            return None, "خطا در دریافت موقعیت مکانی (GPS). در فضای باز مجدد تلاش کنید."
 
     async def refresh_violation_panel_gps() -> None:
         coords, err = await fetch_current_gps(request_if_needed=True)
