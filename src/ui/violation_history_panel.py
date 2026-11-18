@@ -387,7 +387,7 @@ class ViolationHistoryPanel(ft.Container):
         chips: list[ft.Control] = []
         for key, label, icon in specs:
             selected = self._sync_filter == key
-            bg = p.accent if selected else p.subtle_surface
+            bg = p.accent if selected else p.surface_alt
             fg = ft.Colors.WHITE if selected else p.text_primary
             border_col = p.accent if selected else p.border
 

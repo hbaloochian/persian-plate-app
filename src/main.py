@@ -190,7 +190,7 @@ async def main(page: ft.Page) -> None:
         ftg.Geolocator(
             configuration=ftg.GeolocatorConfiguration(
                 accuracy=ftg.GeolocatorPositionAccuracy.HIGH,
-                time_limit=ft.Duration(seconds=10),
+                time_limit=ft.Duration(seconds=20),
             )
         )
         if ftg is not None
@@ -803,15 +803,16 @@ async def main(page: ft.Page) -> None:
                     except Exception:
                         pass
 
-            # مرحله دوم: دریافت موقعیت دقیق و لحظه‌ای از GPS
+            # مرحله دوم: دریافت موقعیت دقیق و لحظه‌ای از GPS با زمان کافی
+            # (تثبیت سیگنال GPS سرد می‌تواند در بسیاری از گوشی‌ها بیشتر از ۱۰ ثانیه طول بکشد)
             pos = await asyncio.wait_for(
                 geolocator.get_current_position(
                     configuration=ftg.GeolocatorConfiguration(
                         accuracy=ftg.GeolocatorPositionAccuracy.HIGH,
-                        time_limit=ft.Duration(seconds=10),
+                        time_limit=ft.Duration(seconds=20),
                     )
                 ),
-                timeout=12.0,
+                timeout=25.0,
             )
             if pos is not None and pos.latitude is not None and pos.longitude is not None:
                 coords = (
@@ -822,8 +823,14 @@ async def main(page: ft.Page) -> None:
                 state.last_gps = coords
                 state.last_gps_ts = time.monotonic()
                 return coords, ""
-            return state.last_gps, "مختصات دقیقی از ماهواره GPS دریافت نشد."
+
+            # در صورت عدم دریافت موقعیت لحظه‌ای، با حفظ بدون هشدار خطا،
+            # به آخرین موقعیت کش‌شده قبلی (اگر موجود باشد) برمی‌گردیم.
+            if state.last_gps is not None:
+                return state.last_gps, ""
+            return None, "مختصات دقیقی از ماهواره GPS دریافت نشد (در فضای باز مجدد تلاش کنید)."
         except asyncio.TimeoutError:
+            # سقوط نرم: در صورت وجود آخرین موقعیت کش‌شده، بدون نمایش خطای timeout آن را نشان می‌دهیم
             if state.last_gps is not None:
                 return state.last_gps, ""
             return None, "زمان دریافت سیگنال GPS به پایان رسید (در فضای باز مجدد تلاش کنید)."
