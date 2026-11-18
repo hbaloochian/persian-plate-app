@@ -162,6 +162,43 @@ def _create_demo_jpeg(color: tuple[int, int, int], size: tuple[int, int] = (320,
     return buf.getvalue()
 
 
+def _build_color_scheme(palette: object) -> ft.ColorScheme:
+    """ساخت یک ColorScheme Material 3 متمرکز بر پالت تم فعلی (شب یا روز).
+
+    این کار باعث می‌شود تمام کنترل‌های بومی Flet (TextField، Dropdown، Switch،
+    Button و ...) به‌صورت خودکار از همان رنگ‌های پالت تم استفاده کنند و
+    از رنگ‌های پیش‌فرض Material که ممکن است با تم انتخاب‌شده همخوانی نداشته باشند،
+    پرهیز شود.
+    """
+    return ft.ColorScheme(
+        primary=palette.accent,
+        on_primary=ft.Colors.WHITE,
+        secondary=palette.surface_alt,
+        on_secondary=palette.text_primary,
+        tertiary=palette.accent,
+        error=ft.Colors.RED_600,
+        on_error=ft.Colors.WHITE,
+        background=palette.page_bg,
+        on_background=palette.text_primary,
+        surface=palette.card_bg,
+        on_surface=palette.text_primary,
+        surface_variant=palette.surface_alt,
+        on_surface_variant=palette.text_secondary,
+        outline=palette.border,
+        outline_variant=palette.border,
+        surface_tint=palette.accent,
+    )
+
+
+def _font_family_available() -> bool:
+    """بررسی حضور فونت فارسی Vazirmatn در assets برنامه (در صورت نبود، فونت پیش‌فرض بستری می‌شود)."""
+    try:
+        assets_dir = Path(__file__).resolve().parent / "assets" / "fonts"
+        return (assets_dir / "Vazirmatn-Regular.ttf").is_file()
+    except OSError:
+        return False
+
+
 async def main(page: ft.Page) -> None:
     # بارگذاری تنظیمات ذخیره‌شده (استعلام خودکار و استعلام تمام پلاکها پیش‌فرض غیرفعال هستند)
     settings = load_settings()
@@ -173,7 +210,15 @@ async def main(page: ft.Page) -> None:
     page.padding = 0
     page.spacing = 0
     page.bgcolor = palette.page_bg
-    page.theme = ft.Theme(color_scheme_seed=BRAND_BLUE)
+
+    # پالت رنگی متمرکز (Material 3) از یک منبع واحد با رنگ‌های تم،
+    # به‌جای color_scheme_seed، تا تمام کنترل‌های بومی (TextField/Dropdown/Switch/...)
+    # دقیقاً از همان رنگ‌های پالت استفاده کنند.
+    page.theme = ft.Theme(color_scheme=_build_color_scheme(palette))
+
+    # فونت فارسی Vazirmatn برای تمام متن‌های UI (در صورت حضور فونت در assets)
+    if _font_family_available():
+        page.font_family = "Vazirmatn"
 
     state = AppRuntimeState()
     engine = PersianPlateEngine(settings=settings)
@@ -508,6 +553,13 @@ async def main(page: ft.Page) -> None:
         expand=True,
         bgcolor=palette.page_bg,
         visible=False,
+        opacity=0.0,
+        scale=ft.Scale(0.98),
+        animation=ft.Animation(
+            duration=260,
+            curve=ft.AnimationCurve.EASE_IN_OUT,
+            forward=ft.AnimationDirection.NORMAL,
+        ),
     )
 
     # نوار کمکی هنگام گرفتن عکس مستندات از دوربین زنده (در حالت تمام‌صفحه ثبت تخلف)
@@ -551,6 +603,13 @@ async def main(page: ft.Page) -> None:
         bgcolor=palette.overlay_scrim,
         border=ft.Border(top=ft.BorderSide(1, palette.border)),
         visible=False,
+        opacity=0.0,
+        scale=ft.Scale(0.98),
+        animation=ft.Animation(
+            duration=240,
+            curve=ft.AnimationCurve.EASE_IN_OUT,
+            forward=ft.AnimationDirection.NORMAL,
+        ),
         content=ft.Column(
             tight=True,
             spacing=10,
@@ -584,6 +643,31 @@ async def main(page: ft.Page) -> None:
                 bgcolor=ft.Colors.RED_700 if is_error else ft.Colors.GREEN_700,
             )
         )
+
+    def _show_overlay(container: ft.Container) -> None:
+        """نمایش نرم یک اوورلای با انیمیشن opacity و scale (ورود صفحه)."""
+        container.visible = True
+        container.opacity = 1.0
+        container.scale = ft.Scale(1.0)
+        try:
+            container.update()
+        except Exception:
+            pass
+
+    async def _hide_overlay(container: ft.Container) -> None:
+        """مخفی‌سازی نرم یک اوورلای با انیمیشن (خروج صفحه)."""
+        container.opacity = 0.0
+        container.scale = ft.Scale(0.98)
+        try:
+            container.update()
+        except Exception:
+            pass
+        await asyncio.sleep(0.28)
+        container.visible = False
+        try:
+            container.update()
+        except Exception:
+            pass
 
     async def refresh_violation_counter(update_ui: bool = True) -> list[ViolationRecord]:
         records = await asyncio.to_thread(load_violation_records)
@@ -747,9 +831,9 @@ async def main(page: ft.Page) -> None:
 
     def switch_to_info_view() -> None:
         state.screen_mode = "info"
-        fullscreen_overlay.visible = False
         fullscreen_overlay.content = None
-        evidence_capture_overlay.visible = False
+        asyncio.create_task(_hide_overlay(fullscreen_overlay))
+        asyncio.create_task(_hide_overlay(evidence_capture_overlay))
         render_server_info_panel()
         refresh_overlay_boxes()
         page.update()
@@ -885,8 +969,8 @@ async def main(page: ft.Page) -> None:
             gps_coords=fresh_cached_gps,
         )
         fullscreen_overlay.content = violation_panel
-        fullscreen_overlay.visible = True
-        evidence_capture_overlay.visible = False
+        _show_overlay(fullscreen_overlay)
+        asyncio.create_task(_hide_overlay(evidence_capture_overlay))
         page.update()
         asyncio.create_task(refresh_violation_panel_gps())
 
@@ -895,8 +979,8 @@ async def main(page: ft.Page) -> None:
         records = await refresh_violation_counter(update_ui=False)
         violation_history_panel.set_records(records)
         fullscreen_overlay.content = violation_history_panel
-        fullscreen_overlay.visible = True
-        evidence_capture_overlay.visible = False
+        _show_overlay(fullscreen_overlay)
+        asyncio.create_task(_hide_overlay(evidence_capture_overlay))
         page.update()
 
     async def reload_history_panel() -> None:
@@ -979,8 +1063,8 @@ async def main(page: ft.Page) -> None:
             state.screen_mode = "evidence_camera"
 
             # مخفی کردن موقت فرم تمام‌صفحه تا کاربر بتواند صحنه تخلف را در دوربین ببیند
-            fullscreen_overlay.visible = False
-            evidence_capture_overlay.visible = True
+            await _hide_overlay(fullscreen_overlay)
+            _show_overlay(evidence_capture_overlay)
             refresh_overlay_boxes()
             page.update()
 
@@ -989,9 +1073,9 @@ async def main(page: ft.Page) -> None:
             finally:
                 state.evidence_capture_future = None
                 state.screen_mode = "violation"
-                evidence_capture_overlay.visible = False
+                await _hide_overlay(evidence_capture_overlay)
                 fullscreen_overlay.content = violation_panel
-                fullscreen_overlay.visible = True
+                _show_overlay(fullscreen_overlay)
                 page.update()
 
             if captured_bytes:
@@ -1515,6 +1599,9 @@ async def main(page: ft.Page) -> None:
         p = get_theme_palette(settings.dark_mode)
         page.theme_mode = ft.ThemeMode.DARK if settings.dark_mode else ft.ThemeMode.LIGHT
         page.bgcolor = p.page_bg
+        page.theme = ft.Theme(color_scheme=_build_color_scheme(p))
+        if _font_family_available():
+            page.font_family = "Vazirmatn"
 
         bottom_section_container.bgcolor = p.panel_bg
         bottom_section_container.border = ft.Border(top=ft.BorderSide(width=1, color=p.border))
