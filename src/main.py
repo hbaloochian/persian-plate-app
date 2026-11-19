@@ -62,6 +62,7 @@ from services.pdf_report import (
     save_pdf_backup_in_app_storage,
     try_write_pdf_to_downloads,
 )
+from services.gps_service import GpsService
 from ui.components import (
     build_iranian_plate_widget,
     build_overlay_shapes,
@@ -202,6 +203,9 @@ async def main(page: ft.Page) -> None:
             page.services.append(local_auth)
         if geolocator is not None:
             page.services.append(geolocator)
+
+    # سرویس متمرکز دریافت موقعیت مکانی (GPS) — منطق آن در modul gps_service.py نگهداری می‌شود
+    gps_service = GpsService(page=page, geolocator=geolocator, ftg=ftg, state=state)
 
     # -----------------------------------------------------------------------
     # کنترل‌های بخش بالای صفحه (دوربین زنده + کادرهای Canvas + نوار HUD)
@@ -758,105 +762,12 @@ async def main(page: ft.Page) -> None:
     # دریافت خودکار موقعیت مکانی (GPS) گوشی با flet-geolocator
     # -----------------------------------------------------------------------
     async def fetch_current_gps(*, request_if_needed: bool = True) -> tuple[tuple[float, float, float | None] | None, str]:
-        """مختصات جغرافیایی فعلی گوشی (lat, lon, accuracy_m) را بدون قفل کردن رابط کاربری دریافت می‌کند."""
-        if geolocator is None or ftg is None:
-            return state.last_gps, "سرویس GPS در این محیط در دسترس نیست."
-
-        if page.platform == ft.PagePlatform.LINUX and not page.web:
-            return state.last_gps, "سنسور GPS روی نسخه اندروید گوشی فعال است."
-
-        try:
-            service_on = await asyncio.wait_for(geolocator.is_location_service_enabled(), timeout=5.0)
-            if not service_on:
-                return state.last_gps, "سرویس موقعیت مکانی (Location/GPS) گوشی خاموش است."
-
-            perm = await asyncio.wait_for(geolocator.get_permission_status(), timeout=5.0)
-            granted_states = (
-                ftg.GeolocatorPermissionStatus.WHILE_IN_USE,
-                ftg.GeolocatorPermissionStatus.ALWAYS,
-            )
-            if perm not in granted_states:
-                if not request_if_needed or perm == ftg.GeolocatorPermissionStatus.DENIED_FOREVER:
-                    return state.last_gps, "مجوز دسترسی به موقعیت مکانی (GPS) صادر نشده است."
-                perm = await asyncio.wait_for(geolocator.request_permission(), timeout=15.0)
-                if perm not in granted_states:
-                    return state.last_gps, "دسترسی به GPS توسط کاربر تأیید نشد."
-
-            # مرحله اول: دریافت فوری آخرین موقعیت کش‌شده دستگاه (کمتر از ۵۰ میلی‌ثانیه)
-            cached_pos = None
-            if not page.web:
-                try:
-                    cached_pos = await asyncio.wait_for(geolocator.get_last_known_position(), timeout=3.0)
-                except Exception:
-                    cached_pos = None
-            if cached_pos is not None and cached_pos.latitude is not None and cached_pos.longitude is not None:
-                state.last_gps = (
-                    float(cached_pos.latitude),
-                    float(cached_pos.longitude),
-                    float(cached_pos.accuracy) if cached_pos.accuracy else None,
-                )
-                state.last_gps_ts = time.monotonic()
-                if state.screen_mode == "violation":
-                    violation_panel.set_gps_location(*state.last_gps)
-                    try:
-                        violation_panel.update()
-                    except Exception:
-                        pass
-
-            # مرحله دوم: دریافت موقعیت دقیق و لحظه‌ای از GPS با زمان کافی
-            # (تثبیت سیگنال GPS سرد می‌تواند در بسیاری از گوشی‌ها بیشتر از ۱۰ ثانیه طول بکشد)
-            pos = await asyncio.wait_for(
-                geolocator.get_current_position(
-                    configuration=ftg.GeolocatorConfiguration(
-                        accuracy=ftg.GeolocatorPositionAccuracy.HIGH,
-                        time_limit=ft.Duration(seconds=20),
-                    )
-                ),
-                timeout=25.0,
-            )
-            if pos is not None and pos.latitude is not None and pos.longitude is not None:
-                coords = (
-                    float(pos.latitude),
-                    float(pos.longitude),
-                    float(pos.accuracy) if pos.accuracy else None,
-                )
-                state.last_gps = coords
-                state.last_gps_ts = time.monotonic()
-                return coords, ""
-
-            # در صورت عدم دریافت موقعیت لحظه‌ای، با حفظ بدون هشدار خطا،
-            # به آخرین موقعیت کش‌شده قبلی (اگر موجود باشد) برمی‌گردیم.
-            if state.last_gps is not None:
-                return state.last_gps, ""
-            return None, "مختصات دقیقی از ماهواره GPS دریافت نشد (در فضای باز مجدد تلاش کنید)."
-        except TimeoutError:
-            # سقوط نرم: در صورت وجود آخرین موقعیت کش‌شده، بدون نمایش خطای timeout آن را نشان می‌دهیم
-            if state.last_gps is not None:
-                return state.last_gps, ""
-            return None, "مختصات دقیق لحظه‌ای دریافت نشد؛ در فضای باز و با سیگنال GPS قوی مجدد تلاش کنید."
-        except Exception as exc:
-            logger.warning("GPS fetch error: %s", exc)
-            if state.last_gps is not None:
-                return state.last_gps, ""
-            # نمایش پیام‌های دوست‌داشتنی فارسی به‌جای متن خطای سرویس (مثل «Location request timed out»)
-            msg = str(exc).lower()
-            if "timed out" in msg or "timeout" in msg:
-                return None, "مختصات دقیق لحظه‌ای دریافت نشد؛ در فضای باز و با سیگنال GPS قوی مجدد تلاش کنید."
-            if "permission" in msg or "denied" in msg:
-                return None, "مجوز دسترسی به موقعیت مکانی (GPS) صادر نشده است."
-            return None, "خطا در دریافت موقعیت مکانی (GPS). در فضای باز مجدد تلاش کنید."
+        """مختصات جغرافیایی فعلی گوشی را از سرویس متمرکز GPS دریافت می‌کند."""
+        return await gps_service.fetch_current_gps(request_if_needed=request_if_needed)
 
     async def refresh_violation_panel_gps() -> None:
-        coords, err = await fetch_current_gps(request_if_needed=True)
-        if state.screen_mode == "violation":
-            if coords is not None:
-                violation_panel.set_gps_location(coords[0], coords[1], coords[2])
-            else:
-                violation_panel.set_gps_location(None, None, None, error_note=err)
-            try:
-                violation_panel.update()
-            except Exception:
-                pass
+        """مختصات جدید GPS را در کارت موقعیت مکانی صفحه ثبت تخلف به‌روزرسانی می‌کند."""
+        await gps_service.refresh_panel_gps(violation_panel)
 
     def switch_to_violation_view(_e=None) -> None:
         state.screen_mode = "violation"
@@ -1501,6 +1412,8 @@ async def main(page: ft.Page) -> None:
         on_export_batch_csv=handle_export_batch_csv,
         dark_mode=settings.dark_mode,
     )
+    # ارجاع صفحه ثبت تخلف به سرویس GPS برای نمایش خودکار موقعیت کش‌شده
+    gps_service.panel = violation_panel
 
     register_violation_btn.on_click = switch_to_violation_view
     review_violations_btn.on_click = switch_to_history_view
@@ -1572,6 +1485,10 @@ async def main(page: ft.Page) -> None:
             label="ورود با اثر انگشت",
             value=settings.biometric_login_enabled,
         )
+        battery_switch = ft.Switch(
+            label="مدیریت باتری",
+            value=settings.battery_saver,
+        )
         theme_switch = ft.Switch(
             label="تم شب / روز",
             value=settings.dark_mode,
@@ -1584,6 +1501,7 @@ async def main(page: ft.Page) -> None:
                 auto_query_switch,
                 all_plates_switch,
                 biometric_switch,
+                battery_switch,
                 theme_switch,
             ],
         )
@@ -1601,6 +1519,7 @@ async def main(page: ft.Page) -> None:
             settings.auto_query_enabled = bool(auto_query_switch.value)
             settings.query_all_plates = bool(all_plates_switch.value)
             settings.biometric_login_enabled = bool(biometric_switch.value)
+            settings.battery_saver = bool(battery_switch.value)
             settings.dark_mode = bool(theme_switch.value)
             save_settings(settings)
             api_client.clear_cache()

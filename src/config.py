@@ -127,6 +127,9 @@ class AppSettings:
     # ورود با اثر انگشت (احراز هویت بیومتریک گوشی): پیش‌فرض غیرفعال
     biometric_login_enabled: bool = False
 
+    # حالت مدیریت باتری (باگذری): پیش‌فرض غیرفعال
+    battery_saver: bool = False
+
     # پارامترهای مدل هوش مصنوعی (قابل تنظیم برای توازن سرعت/دقت)
     input_size: int = 640
     cars_conf_threshold: float = 0.55
@@ -153,6 +156,20 @@ class AppSettings:
             else f"/{self.api_violation_path}"
         )
         return f"{base}{path}"
+
+
+def resolve_ort_threads(settings: AppSettings) -> int:
+    """تعداد تراشه‌های پردازش ORT را بر اساس منابع دستگاه و حالت مدیریت باتری تعیین می‌کند.
+
+    - در حالت مدیریت باتری، برای حفظ باتری تراشه‌ها را روی ۲ کاهش می‌دهد.
+    - در حالت عادی، تعداد تراشه‌های قابل اعتماد دستگاه را بر اساس تعداد تراشه‌های CPU
+      تشخیص می‌دهد و آن را در بازه [1, 4] نگه می‌دارد تا از افزایش بار هسته و گرم‌شدن
+    دستگاهی با تراشه‌های زیاد جلوگیری کند.
+    """
+    if settings.battery_saver:
+        return 2
+    cpu_count = os.cpu_count() or 4
+    return max(1, min(4, cpu_count))
 
 
 def get_settings_file_path(data_dir: Path | None = None) -> Path:
@@ -185,6 +202,8 @@ def load_settings(data_dir: Path | None = None) -> AppSettings:
             settings.dark_mode = data["dark_mode"]
         if isinstance(data.get("biometric_login_enabled"), bool):
             settings.biometric_login_enabled = data["biometric_login_enabled"]
+        if isinstance(data.get("battery_saver"), bool):
+            settings.battery_saver = data["battery_saver"]
     except (OSError, ValueError):
         pass
     return settings
@@ -201,6 +220,7 @@ def save_settings(settings: AppSettings, data_dir: Path | None = None) -> None:
         "query_all_plates": bool(settings.query_all_plates),
         "dark_mode": bool(settings.dark_mode),
         "biometric_login_enabled": bool(settings.biometric_login_enabled),
+        "battery_saver": bool(settings.battery_saver),
     }
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 

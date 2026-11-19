@@ -423,7 +423,36 @@ class PlateApiClient:
         confidence: float = 0.0,
         force_refresh: bool = False,
     ) -> ApiCheckResult:
-        """پلاک را به API در آدرس myweb.web.com ارسال کرده و نتیجه را برمی‌گرداند."""
+        """پلاک را به API سرور استعلام می‌کند و نتیجه را برمی‌گرداند.
+
+        این تابع درخواست `POST` به آدرس `settings.check_url` (به‌صورت پیش‌فرض
+        `http://myweb.web.com/api/plate/check`) ارسال می‌کند و پاسخ آن را
+        به‌صورت یک `ApiCheckResult` تفسیر می‌کند.
+
+        **محتوای بدنه درخواست (JSON):**
+        - `plate`: شماره پلاک به‌صورت فارسی (مثلاً «۱۲ ب ۳۴۵ | ایران ۱۱»)
+        - `plate_latin`: شماره پلاک به‌صورت لاتین (مثلاً «12B34511»)
+        - `confidence`: میزان اطمینان مدل از خوانش پلاک (عدد بین 0 و 1)
+        - `timestamp`: زمان ارسال به‌صورت ISO 8601
+
+        **تفسیر پاسخ سرور (تبديل رنگ کادر):**
+        - پاسخ متن ساده `"NO"` یا JSON دارای ارزش `NO` در فیلدهای
+          `status` / `result` / `answer` / `response` / `decision` / `code`
+          یا `allowed: false` ← وضعیت `REJECTED` (**کادر قرمز**)
+        - هر پاسخ موفق (HTTP 2xx) غیر از `NO` (مثلاً `"YES"` یا
+          `{"status": "OK", ...}`) ← وضعیت `APPROVED` (**کادر سبز**)
+        - خطای شبکه یا timeout ← وضعیت `ERROR` (**کادر آبی + هشدار**)
+
+        **نحوه مدیریت کش و تداخل:**
+        - در صورت نبود `force_refresh`، نتایج قبلی از کش TTL (با دوره
+          `api_cache_ttl_seconds`) بازگردانده می‌شوند تا درخواست تکراری
+          ارسال نشود.
+        - اگر درخواست هم‌زمان برای پلاک برابر در حال اجرا باشد، همان
+          درخواست در حال اجرا بازگردانده می‌شود (تداخل درخواست حذف می‌شود).
+
+        **مقایسه:** این تابع تنها مدخل API برای استعلام پلاک است و تمام
+        مدیریت کش، تداخل و تفسیر پاسخ در آن متمرکز شده است.
+        """
         plate_key = plate_latin or plate_persian
         if not force_refresh:
             cached = self.get_cached(plate_key)
@@ -510,7 +539,33 @@ class PlateApiClient:
         longitude: float | None = None,
         location_accuracy_m: float | None = None,
     ) -> ViolationSubmissionResult:
-        """گزارش تخلف (همراه با تاریخ شمسی، ساعت، موقعیت GPS و تصاویر) را به سرور ارسال و محلی ذخیره می‌کند."""
+        """گزارش تخلف (همراه با تاریخ شمسی، ساعت، موقعیت GPS و تصاویر) را به سرور ارسال می‌کند.
+
+        این تابع یک تخلف جدید را به سرور ارسال کرده و محلی نیز ثبت می‌کند،
+        به‌گونه‌ای که در صورت قطعی اتصال، اطلاعات از دست نرود.
+
+        **محتوای بدنه درخواست (JSON) به آدرس `settings.violation_url`:**
+        - `id`: شناسه‌ی منحصربه‌فرد تخلف (مولتی‌کالم: `v-YYYYmmddHHMMSS-6هکساخالی`)
+        - `plate` / `plate_latin`: پلاک به‌صورت فارسی و لاتین
+        - `violation_type`: نوع تخلف
+        - `description`: توضیحات تخلف
+        - `timestamp`: زمان ارسال به‌صورت ISO 8601
+        - `jalali_date` / `jalali_time` / `jalali_datetime` / `jalali_weekday`:
+          تاریخ و ساعت به‌صورت جلالی (شمسی)
+        - `latitude` / `longitude` / `location_accuracy_m`: موقعیت GPS
+        - `has_image` / `has_evidence_image`: نشانه‌ی وجود تصویر
+        - `image_base64` / `evidence_image_base64`: تصویر برش پلاک و تصویر
+          مستندات تخلف به‌صورت base64 (در صورت وجود)
+
+        **اقدام‌ها و نتایج:**
+        - در صورت پاسخ HTTP 2xx ← `success=True` (همگام‌سازی با سرور)
+        - در صورت خطای سرور (کد غیر 2xx) ← `success=False`، اما رکورد **همان‌حظ
+          محلی ذخیره می‌شود** و قابل ارسال‌مجدد است.
+        - در صورت قطعی اتصال ← `success=False`، با ذخیره‌ی محلی و هشدار
+          مناسب. در تمام موارد `saved_locally` نشان‌دهنده‌ی ثبت محلی است.
+
+        نتایج در یک `ViolationSubmissionResult` قابل‌تست برمی‌گردند.
+        """
         now_ir = now_iran_datetime()
         jalali_date = format_jalali_date(now_ir, persian_digits=False)
         jalali_time = format_jalali_time(now_ir, persian_digits=False)
@@ -598,7 +653,20 @@ class PlateApiClient:
         )
 
     async def retry_violation_sync(self, record: ViolationRecord) -> ViolationSubmissionResult:
-        """ارسال مجدد یک تخلف ذخیره‌شده محلی به سرور myweb.web.com."""
+        """ارسال مجدد یک تخلف ذخیره‌شده محلی به سرور myweb.web.com.
+
+        این تابع برای همگام‌سازی تخلفاتی است که پیش‌تر ناموفق ثبت شدند
+        (مثلاً در زمان قطعی اتصال). محتویات درخواست همان سازوکار
+        `submit_violation` را دارد، اما داده‌ها از رکورد محلی (`ViolationRecord`)
+        و تصاویر ذخیره‌شده‌ی آن بازیابی می‌شوند.
+
+        **اقدام‌ها و نتایج:**
+        - در صورت پاسخ HTTP 2xx ← وضعیت همگام‌سازی در فایل محلی
+          (`update_violation_sync_status`) به `synced=True` تغییر می‌کند و
+          نتیجه با `success=True` برمی‌گردد.
+        - در صورت خطای سرور یا قطعی اتصال ← `success=False` با message
+          مناسب، اما رکورد محلی حفظ می‌شود تا ارسال مجدد موردنیاز باشد.
+        """
         plate_bytes = read_violation_image_bytes(record.plate_image_file)
         evidence_bytes = read_violation_image_bytes(record.evidence_image_file)
 

@@ -33,6 +33,7 @@ from config import (
     AppSettings,
     find_weights_dir,
     format_iranian_plate,
+    resolve_ort_threads,
 )
 
 logger = logging.getLogger(__name__)
@@ -448,16 +449,18 @@ class PersianPlateEngine:
             return False
 
         try:
+            # تعداد تراشه‌های ORT بر اساس منابع دستگاه (و حالت مدیریت باتری) تنظیم می‌شود
+            ort_threads = resolve_ort_threads(self.settings)
             self.cars_model = OnnxYoloSession(
                 model_path=cars_path,
                 input_size=self.settings.input_size,
-                num_threads=self.settings.ort_threads,
+                num_threads=ort_threads,
             )
             if chars_path is not None:
                 self.chars_model = OnnxYoloSession(
                     model_path=chars_path,
                     input_size=self.settings.input_size,
-                    num_threads=self.settings.ort_threads,
+                    num_threads=ort_threads,
                 )
                 self.single_stage_mode = False
             else:
