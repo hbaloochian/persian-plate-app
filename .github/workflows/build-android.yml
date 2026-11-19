@@ -1,7 +1,6 @@
 name: Build Android APK (Fast Cached)
 
 on:
-
   workflow_dispatch:
     inputs:
       auto_export_onnx:
@@ -177,7 +176,7 @@ jobs:
             yes | "${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null 2>&1 || true
           fi
 
-      - name: 13. تنظیم حافظه بهینه Gradle و ساخت فایل نصبی اندروید (Release APK)
+      - name: 13. تنظیم حافظه بهینه Gradle، پاک‌سازی build و ساخت فایل نصبی اندروید (Release APK)
         run: |
           mkdir -p ~/.gradle
           cat <<'EOF' > ~/.gradle/gradle.properties
@@ -187,12 +186,44 @@ jobs:
           org.gradle.parallel=false
           org.gradle.vfs.watch=false
           EOF
+          echo "=== پاک‌سازی پوشه build برای جلوگیری از بقایای APK مخربد و DEX ناقص ==="
+          rm -rf build
           echo "=== وضعیت حافظه RAM و فضای آزاد دیسک قبل از ساخت APK ==="
           free -h
           df -h /
           uv run flet build apk --yes --verbose
 
-      - name: 14. گزارش وضعیت منابع در صورت بروز خطا (تشخیص OOM/دیسک)
+      - name: 14. صدور گواهی معتبر بودن DEX در APK (اصلاح خطای ClassNotFoundException)
+        run: |
+          echo "=== بررسی فایل‌های DEX در خروجی‌های APK ==="
+          APK_FILES=$(ls -1 build/apk/*.apk 2>/dev/null || true)
+          if [ -z "$APK_FILES" ]; then
+            echo "::error::هیچ فایلی در build/apk یافت نشد!"
+            exit 1
+          fi
+          for apk in $APK_FILES; do
+            echo "--- بررسی: $apk ---"
+            SIZE=$(stat -c%s "$apk")
+            echo "حجم APK: $SIZE بایت"
+            # بررسی وجود classes.dex و غیرصفر بودن آن (DEX خالی = خرابی کلاس‌های بومی)
+            DEX_LIST=$(unzip -l "$apk" 2>/dev/null | grep -E "classes[0-9]*\.dex$" || true)
+            if [ -z "$DEX_LIST" ]; then
+              echo "::error::APK با نام $apk هیچ فایل DEX (classes*.dex) ندارد! این cause خطای ClassNotFoundException در گوشی است."
+              exit 1
+            fi
+            echo "$DEX_LIST"
+            for dex in $(echo "$DEX_LIST" | awk '{print $4}'); do
+              DEX_SIZE=$(unzip -p "$apk" "$dex" 2>/dev/null | wc -c)
+              echo "  - $dex : $DEX_SIZE بایت"
+              if [ "$DEX_SIZE" -lt 1024 ]; then
+                echo "::error::فایل DEX $dex در $apk بیش از حد کوچک ($DEX_SIZE بایت) — احتمالاً خراب است."
+                exit 1
+              fi
+            done
+            echo "::notice::DEX معتبر در $apk تأیید شد ($(echo "$DEX_LIST" | wc -l) فایل)."
+          done
+
+      - name: 15. گزارش وضعیت منابع در صورت بروز خطا (تشخیص OOM/دیسک)
         if: failure()
         run: |
           echo "=== حافظه RAM ==="
@@ -202,7 +233,7 @@ jobs:
           echo "=== بررسی پیام‌های OOM هسته لینوکس ==="
           sudo dmesg -T 2>/dev/null | grep -iE 'oom|killed|out of memory' | tail -n 20 || true
 
-      - name: 15. آپلود فایل APK نهایی برای دانلود مستقیم
+      - name: 16. آپلود فایل APK نهایی برای دانلود مستقیم
         uses: actions/upload-artifact@v4
         with:
           name: persian-plate-scanner-android-apk
@@ -210,7 +241,7 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-      - name: 16. آپلود فایل‌های ONNX جهت دانلود جداگانه
+      - name: 17. آپلود فایل‌های ONNX جهت دانلود جداگانه
         uses: actions/upload-artifact@v4
         with:
           name: persian-plate-onnx-models
