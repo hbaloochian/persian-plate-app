@@ -1,6 +1,10 @@
 name: Build Android APK (Fast Cached)
 
 on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
   workflow_dispatch:
     inputs:
       auto_export_onnx:
@@ -176,7 +180,7 @@ jobs:
             yes | "${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null 2>&1 || true
           fi
 
-      - name: 13. تنظیم حافظه بهینه Gradle، پاک‌سازی build و ساخت فایل نصبی اندروید (Release APK)
+      - name: 13. تنظیم حافظه بهینه Gradle، پاک‌سازی کاشی و خروجی، و ساخت فایل نصبی اندروید (Release APK)
         run: |
           mkdir -p ~/.gradle
           cat <<'EOF' > ~/.gradle/gradle.properties
@@ -186,8 +190,13 @@ jobs:
           org.gradle.parallel=false
           org.gradle.vfs.watch=false
           EOF
-          echo "=== پاک‌سازی پوشه build برای جلوگیری از بقایای APK مخربد و DEX ناقص ==="
+          echo "=== پاک‌سازی پوشه build و کاشی‌های Gradle/Flet برای جلوگیری از DEX خراب (علامت ClassNotFoundException) ==="
           rm -rf build
+          # کاشی Gradle و Flet ممکن است از ساخت‌های قبلی (به‌ویژه در دورهٔ OOM) آسیب‌دیده باشند
+          # و DEX خراب را بازتولید کنند — حتماً پاک می‌شوند.
+          rm -rf ~/.gradle/caches/build-cache-1
+          rm -rf ~/.gradle/caches/transforms-*
+          rm -rf ~/.flet
           echo "=== وضعیت حافظه RAM و فضای آزاد دیسک قبل از ساخت APK ==="
           free -h
           df -h /
@@ -205,6 +214,10 @@ jobs:
             echo "--- بررسی: $apk ---"
             SIZE=$(stat -c%s "$apk")
             echo "حجم APK: $SIZE بایت"
+            if [ "$SIZE" -lt 5000000 ]; then
+              echo "::error::APK $apk بسیار کوچک است ($SIZE بایت) — احتمالاً ساخت ناقص. یک APP Flet کامل باید بزرگتر باشد."
+              exit 1
+            fi
             # بررسی وجود classes.dex و غیرصفر بودن آن (DEX خالی = خرابی کلاس‌های بومی)
             DEX_LIST=$(unzip -l "$apk" 2>/dev/null | grep -E "classes[0-9]*\.dex$" || true)
             if [ -z "$DEX_LIST" ]; then
@@ -212,15 +225,21 @@ jobs:
               exit 1
             fi
             echo "$DEX_LIST"
+            TOTAL_DEX=0
             for dex in $(echo "$DEX_LIST" | awk '{print $4}'); do
               DEX_SIZE=$(unzip -p "$apk" "$dex" 2>/dev/null | wc -c)
               echo "  - $dex : $DEX_SIZE بایت"
-              if [ "$DEX_SIZE" -lt 1024 ]; then
+              TOTAL_DEX=$((TOTAL_DEX + DEX_SIZE))
+              if [ "$DEX_SIZE" -lt 10240 ]; then
                 echo "::error::فایل DEX $dex در $apk بیش از حد کوچک ($DEX_SIZE بایت) — احتمالاً خراب است."
                 exit 1
               fi
             done
-            echo "::notice::DEX معتبر در $apk تأیید شد ($(echo "$DEX_LIST" | wc -l) فایل)."
+            if [ "$TOTAL_DEX" -lt 500000 ]; then
+              echo "::error::کل DEX در $apk بیش از حد کوچک ($TOTAL_DEX بایت مجموع) — ساخت خراب است."
+              exit 1
+            fi
+            echo "::notice::DEX معتبر در $apk تأیید شد ($(echo "$DEX_LIST" | wc -l) فایل، مجموع $TOTAL_DEX بایت)."
           done
 
       - name: 15. گزارش وضعیت منابع در صورت بروز خطا (تشخیص OOM/دیسک)
