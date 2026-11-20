@@ -197,25 +197,54 @@ def test_geometry_rotation_and_canvas_mapping() -> None:
 
 
 def test_server_response_parsing_red_and_green_rules() -> None:
-    # پاسخ متنی NO -> قرمز (REJECTED)
-    r_no = parse_server_plate_response(200, "NO", "12ب34567", "12B34567", 25.0)
-    assert r_no.status == PlateCheckStatus.REJECTED
-
     # پاسخ JSON با status=no -> قرمز (REJECTED)
     r_json_no = parse_server_plate_response(
-        200, '{"status": "no", "reason": "تخلف طرح ترافیک"}', "12ب34567", "12B34567", 30.0
+        200,
+        '{"status": "no", "passenger": 3, "description": "تخلف طرح ترافیک"}',
+        "12ب34567",
+        "12B34567",
+        30.0,
     )
     assert r_json_no.status == PlateCheckStatus.REJECTED
+    assert r_json_no.details["status"] == "no"
+    assert r_json_no.details["passenger"] == 3
 
-    # پاسخ غیر از NO -> سبز (APPROVED)
-    r_yes = parse_server_plate_response(200, "YES", "12ب34567", "12B34567", 22.0)
-    assert r_yes.status == PlateCheckStatus.APPROVED
+    # پاسخ JSON با status=yes -> سبز (APPROVED)
+    r_json_yes = parse_server_plate_response(
+        200,
+        '{"status": "yes", "passenger": 5, "description": "مجوز دارد"}',
+        "12ب34567",
+        "12B34567",
+        22.0,
+    )
+    assert r_json_yes.status == PlateCheckStatus.APPROVED
+    assert r_json_yes.details["status"] == "yes"
 
-    r_json_ok = parse_server_plate_response(
+    # پاسخ متن ساده NO (نامعتبر در قرارداد جدید) -> ERROR
+    r_text_no = parse_server_plate_response(200, "NO", "12ب34567", "12B34567", 25.0)
+    assert r_text_no.status == PlateCheckStatus.ERROR
+
+    # پاسخ JSON با status نامعتبر -> ERROR
+    r_bad_status = parse_server_plate_response(
         200, '{"status": "OK", "owner": "شرکت نمونه"}', "12ب34567", "12B34567", 18.0
     )
-    assert r_json_ok.status == PlateCheckStatus.APPROVED
-    assert r_json_ok.details["owner"] == "شرکت نمونه"
+    assert r_bad_status.status == PlateCheckStatus.ERROR
+
+    # پاسخ JSON نامعتبر (غیرشیء) -> ERROR
+    r_bad_json = parse_server_plate_response(200, "[1,2,3]", "12ب34567", "12B34567", 15.0)
+    assert r_bad_json.status == PlateCheckStatus.ERROR
+
+    # passenger نامعتبر: رنگ فقط از status تأثیر می‌گیرد -> سبز (APPROVED)
+    r_bad_passenger = parse_server_plate_response(
+        200, '{"status": "yes", "passenger": 150}', "12ب34567", "12B34567", 12.0
+    )
+    assert r_bad_passenger.status == PlateCheckStatus.APPROVED
+
+    # description نامعتبر: رنگ فقط از status تأثیر می‌گیرد -> سبز (APPROVED)
+    r_bad_desc = parse_server_plate_response(
+        200, '{"status": "yes", "description": 123}', "12ب34567", "12B34567", 11.0
+    )
+    assert r_bad_desc.status == PlateCheckStatus.APPROVED
 
     # خطای 500 سرور -> ERROR (کادر آبی باقی می‌ماند)
     r_err = parse_server_plate_response(500, "Internal Server Error", "12ب34567", "12B34567", 50.0)

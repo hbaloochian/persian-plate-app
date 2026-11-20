@@ -589,6 +589,63 @@ async def main(page: ft.Page) -> None:
             )
         )
 
+    def show_server_response_dialog(api_res: ApiCheckResult) -> None:
+        """پاسخ سرور را در یک پنجره جدید (با دکمه بستن) نمایش می‌دهد."""
+        p = get_theme_palette(settings.dark_mode)
+        rows: list[ft.Control] = [
+            _info_row("وضعیت (status)", api_res.details.get("status", "---")),
+        ]
+        passenger_val = api_res.details.get("passenger")
+        rows.append(
+            _info_row("تعداد مسافر (passenger)", "---" if passenger_val is None else str(passenger_val))
+        )
+        description_val = api_res.details.get("description")
+        rows.append(
+            _info_row("توضیحات (description)", "---" if description_val is None else str(description_val))
+        )
+        rows.append(ft.Divider(height=6, color=p.border))
+        rows.append(
+            ft.Container(
+                padding=ft.Padding.all(6),
+                border_radius=ft.BorderRadius.all(8),
+                bgcolor=p.card_bg,
+                content=ft.Text(
+                    "پاسخ کامل سرور:",
+                    size=12,
+                    color=p.text_muted,
+                    weight=ft.FontWeight.W_600,
+                ),
+            )
+        )
+        rows.append(
+            ft.Container(
+                padding=ft.Padding.all(8),
+                border_radius=ft.BorderRadius.all(8),
+                bgcolor=p.card_bg,
+                content=ft.Text(
+                    api_res.raw_response or "(پاسخ خالی)",
+                    size=12,
+                    color=p.text_primary,
+                ),
+            )
+        )
+
+        def _close_server_response_dialog(_e=None) -> None:
+            page.close_dialog()
+
+        page.show_dialog(
+            ft.AlertDialog(
+                title=ft.Text("پاسخ سرور برای این پلاک"),
+                content=ft.Container(
+                    width=360,
+                    content=ft.Column(tight=True, spacing=8, controls=rows),
+                ),
+                actions=[
+                    ft.FilledButton("بستن", on_click=_close_server_response_dialog),
+                ],
+            )
+        )
+
     async def refresh_violation_counter(update_ui: bool = True) -> list[ViolationRecord]:
         records = await asyncio.to_thread(load_violation_records)
         count = len(records)
@@ -722,8 +779,14 @@ async def main(page: ft.Page) -> None:
             else:
                 rows.append(_info_row("زمان استعلام", to_persian_digits(api_res.checked_at)))
                 rows.append(_info_row("سرعت پاسخ سرور", to_persian_digits(f"{int(api_res.latency_ms)} میلی‌ثانیه")))
+                label_map = {
+                    "status": "وضعیت (status)",
+                    "passenger": "تعداد مسافر (passenger)",
+                    "description": "توضیحات (description)",
+                }
                 for key, val in api_res.details.items():
-                    rows.append(_info_row(str(key), str(val)))
+                    display_val = "---" if val is None else str(val)
+                    rows.append(_info_row(label_map.get(str(key), str(key)), display_val))
         else:
             if not engine.single_stage_mode and not plate.complete:
                 rows.append(_info_row("وضعیت", "در حال خوانش کامل ۸ کاراکتر پلاک (کادر آبی)..."))
@@ -1594,6 +1657,9 @@ async def main(page: ft.Page) -> None:
                     if state.screen_mode == "info":
                         render_server_info_panel()
                         bottom_section_container.update()
+                        # در صورت پاسخ yes (مجوز)، پاسخ سرور در پنجره جدید نمایش داده می‌شود
+                        if result.status == PlateCheckStatus.APPROVED:
+                            show_server_response_dialog(result)
 
             refresh_overlay_boxes()
             return result

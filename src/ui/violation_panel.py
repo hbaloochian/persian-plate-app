@@ -65,7 +65,7 @@ class ViolationRegistrationPanel(ft.Container):
         self.plate_input = EditableIranianPlateInput(page=page, border_color=ft.Colors.BLUE_500)
 
         self.violation_dropdown = ft.Dropdown(
-            label="نوع تخلف",
+            label="نوع تخلف (الزامی)",
             value=VIOLATION_TYPES[0],
             expand=True,
             options=[
@@ -75,7 +75,7 @@ class ViolationRegistrationPanel(ft.Container):
         )
 
         self.notes_field = ft.TextField(
-            label="توضیحات تکمیلی (اختیاری)",
+            label="توضیحات تکمیلی (الزامی)",
             hint_text="محل دقیق تخلف یا یادداشت مأمور...",
             expand=True,
             multiline=True,
@@ -273,7 +273,7 @@ class ViolationRegistrationPanel(ft.Container):
         )
 
         self._plate_label = ft.Text(
-            "شماره پلاک خودرو (قابل ویرایش مستقیم روی پلاک):",
+            "شماره پلاک خودرو (الزامی — قابل ویرایش مستقیم روی پلاک):",
             size=13,
             color=self._palette.text_secondary,
             weight=ft.FontWeight.W_600,
@@ -570,6 +570,20 @@ class ViolationRegistrationPanel(ft.Container):
             self.status_banner.value = (
                 "لطفاً تمامی بخش‌های پلاک ایران (۲ رقم، حرف، ۳ رقم و کد ۲ رقمی ایران) را کامل وارد کنید."
             )
+            self.status_banner.visible = True
+            self.update()
+            return
+
+        # فیلد «نوع تخلف» الزامی است
+        if not (self.violation_dropdown.value or "").strip():
+            self.status_banner.value = "لطفاً نوع تخلف را انتخاب کنید."
+            self.status_banner.visible = True
+            self.update()
+            return
+
+        # فیلد «توضیحات تکمیلی» الزامی است
+        if not (self.notes_field.value or "").strip():
+            self.status_banner.value = "لطفاً توضیحات تکمیلی را وارد کنید."
             self.status_banner.visible = True
             self.update()
             return

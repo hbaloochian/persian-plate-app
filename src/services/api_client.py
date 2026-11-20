@@ -318,12 +318,25 @@ def parse_server_plate_response(
     plate_latin: str,
     latency_ms: float,
 ) -> ApiCheckResult:
-    """پاسخ متنی یا JSON سرور myweb.web.com را تحلیل و وضعیت رنگ کادر را مشخص می‌کند.
+    """پاسخ سرور myweb.web.com را با ساختار قرارداد محدود تفسیر می‌کند.
 
-    قاعده اصلی مطابق نیازمندی:
-    - در صورت پاسخ NO (به‌صورت متن ساده "NO" یا درون فیلدهای JSON مانند status/result/answer/response
-      یا مقدار allowed=false) => وضعیت REJECTED (کادر قرمز)
-    - در غیر این صورت (پاسخ موفق 2xx غیر از NO) => وضعیت APPROVED (کادر سبز)
+    سازوکار پاسخ برای استعلام دستی و خودکار به ساختار JSON زیر **محدود** شده است:
+    ```json
+    {
+      "status": "yes" | "no",
+      "passenger": <عدد صحیح، کوچک‌تر از ۱۰۰>,
+      "description": "<رشته>"
+    }
+    ```
+
+    **تغییر رنگ کادر فقط و فقط به مقدار فیلد `status` محدود است:**
+    - `status` = `"no"` ← وضعیت **REJECTED** (کادر قرمز).
+    - `status` = `"yes"` ← وضعیت **APPROVED** (کادر سبز).
+
+    فیلدهای `passenger` و `description` **هیچ تأثیری بر رنگ کادر ندارند** و فقط
+    برای نمایش در بخش اطلاعات پاسخ سرور نگهداری می‌شوند (حتی در صورت
+    نامعتبر یا نبودن، پاسخ از حالت ERROR خارج نمی‌شود). تنها زماني که رنگ قابل
+    تعیین نباشد (JSON نامعتبر، شیء‌افتاده، یا فیلد `status` نامعتبر) ← وضعیت **ERROR**.
     """
     now_str = datetime.now().strftime("%H:%M:%S")
     cleaned = response_text.strip()
@@ -339,41 +352,45 @@ def parse_server_plate_response(
             error_message=f"خطای سرور (کد {status_code})",
         )
 
-    details: dict[str, Any] = {}
-    verdict_is_no = False
+    def _error(message: str) -> ApiCheckResult:
+        return ApiCheckResult(
+            plate_persian=plate_persian,
+            plate_latin=plate_latin,
+            status=PlateCheckStatus.ERROR,
+            raw_response=cleaned,
+            latency_ms=latency_ms,
+            checked_at=now_str,
+            error_message=message,
+        )
 
-    if cleaned.upper() == "NO":
-        verdict_is_no = True
-        details = {"پاسخ سرور": "NO"}
-    else:
-        try:
-            parsed = json.loads(cleaned)
-            if isinstance(parsed, dict):
-                details = parsed
-                # بررسی فیلدهای رایج پاسخ در APIهای REST
-                for key in ("status", "result", "response", "answer", "decision", "code"):
-                    val = parsed.get(key)
-                    if isinstance(val, str) and val.strip().upper() == "NO":
-                        verdict_is_no = True
-                        break
-                if parsed.get("allowed") is False or parsed.get("valid") is False:
-                    verdict_is_no = True
-            elif isinstance(parsed, str):
-                verdict_is_no = parsed.strip().upper() == "NO"
-                details = {"پاسخ سرور": parsed}
-            elif isinstance(parsed, bool):
-                verdict_is_no = not parsed
-                details = {"پاسخ سرور": "YES" if parsed else "NO"}
-            else:
-                details = {"پاسخ سرور": str(parsed)}
-        except json.JSONDecodeError:
-            verdict_is_no = cleaned.upper() == "NO"
-            details = {"پاسخ سرور": cleaned or "OK"}
+    try:
+        parsed = json.loads(cleaned)
+    except json.JSONDecodeError:
+        return _error("پاسخ سرور باید به‌صورت JSON معتبر باشد.")
+
+    if not isinstance(parsed, dict):
+        return _error("پاسخ سرور باید یک شیء JSON باشد.")
+
+    # تعیین رنگ کادر ONLY از فیلد status
+    status_val = parsed.get("status")
+    if not isinstance(status_val, str) or status_val.strip().lower() not in ("yes", "no"):
+        return _error("فیلد status باید یکی از مقادیر yes یا no باشد.")
+
+    # فیلدهای passenger و description برای نمایش نگهداری می‌شوند و بر رنگ تأثیر نمی‌گذارند
+    passenger = parsed.get("passenger")
+    description = parsed.get("description")
+
+    is_no = status_val.strip().lower() == "no"
+    details = {
+        "status": status_val.strip().lower(),
+        "passenger": passenger,
+        "description": description,
+    }
 
     return ApiCheckResult(
         plate_persian=plate_persian,
         plate_latin=plate_latin,
-        status=PlateCheckStatus.REJECTED if verdict_is_no else PlateCheckStatus.APPROVED,
+        status=PlateCheckStatus.REJECTED if is_no else PlateCheckStatus.APPROVED,
         raw_response=cleaned,
         details=details,
         latency_ms=latency_ms,
@@ -436,11 +453,14 @@ class PlateApiClient:
         - `timestamp`: زمان ارسال به‌صورت ISO 8601
 
         **تفسیر پاسخ سرور (تبديل رنگ کادر):**
-        - پاسخ متن ساده `"NO"` یا JSON دارای ارزش `NO` در فیلدهای
-          `status` / `result` / `answer` / `response` / `decision` / `code`
-          یا `allowed: false` ← وضعیت `REJECTED` (**کادر قرمز**)
-        - هر پاسخ موفق (HTTP 2xx) غیر از `NO` (مثلاً `"YES"` یا
-          `{"status": "OK", ...}`) ← وضعیت `APPROVED` (**کادر سبز**)
+        پاسخ باید به‌صورت JSON معتبر با ساختار قرارداد زیر باشد:
+        ```json
+        {"status": "yes" | "no", "passenger": <عدد صحیح، < ۱۰۰>, "description": "<رشته>"}
+        ```
+        - `status` = `"no"` ← وضعیت `REJECTED` (**کادر قرمز**)
+        - `status` = `"yes"` ← وضعیت `APPROVED` (**کادر سبز**)
+        - پاسخ غیر JSON، JSON نامعتبر، یا فیلدهای `status`/`passenger`/`description`
+          نامعتبر ← وضعیت `ERROR` (**کادر آبی + هشدار**)
         - خطای شبکه یا timeout ← وضعیت `ERROR` (**کادر آبی + هشدار**)
 
         **نحوه مدیریت کش و تداخل:**
