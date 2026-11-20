@@ -1657,7 +1657,8 @@ async def main(page: ft.Page) -> None:
                     if state.screen_mode == "info":
                         render_server_info_panel()
                         bottom_section_container.update()
-                        # در صورت پاسخ yes (مجوز)، پاسخ سرور در پنجره جدید نمایش داده می‌شود
+                        # در هر حالت (خودکار یا دستی)، اگر پاسخ سرور yes (مجوز) بود،
+                        # پنجره نمایش اطلاعات ارسالی سرور نمایش داده می‌شود
                         if result.status == PlateCheckStatus.APPROVED:
                             show_server_response_dialog(result)
 
