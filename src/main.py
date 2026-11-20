@@ -631,7 +631,7 @@ async def main(page: ft.Page) -> None:
         )
 
         def _close_server_response_dialog(_e=None) -> None:
-            page.close_dialog()
+            page.pop_dialog()
 
         page.show_dialog(
             ft.AlertDialog(
