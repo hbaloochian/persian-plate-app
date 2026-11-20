@@ -12,6 +12,8 @@ import logging
 import time
 from typing import Any
 
+import flet as ft
+
 logger = logging.getLogger(__name__)
 
 
@@ -43,7 +45,7 @@ class GpsService:
         if self.geolocator is None or self.ftg is None:
             return self.state.last_gps, "سرویس GPS در این محیط در دسترس نیست."
 
-        if self.page.platform == self.ftg.PagePlatform.LINUX and not self.page.web:
+        if self.page.platform == ft.PagePlatform.LINUX and not self.page.web:
             return self.state.last_gps, "سنسور GPS روی نسخه اندروید گوشی فعال است."
 
         try:
@@ -96,7 +98,7 @@ class GpsService:
                 self.geolocator.get_current_position(
                     configuration=self.ftg.GeolocatorConfiguration(
                         accuracy=self.ftg.GeolocatorPositionAccuracy.HIGH,
-                        time_limit=self.ftg.Duration(seconds=20),
+                        time_limit=ft.Duration(seconds=20),
                     )
                 ),
                 timeout=25.0,
