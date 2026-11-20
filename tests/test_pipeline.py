@@ -228,7 +228,7 @@ def test_api_client_caching_avoids_duplicate_requests() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         nonlocal call_count
         call_count += 1
-        assert str(request.url) == "http://myweb.web.com/api/plate/check"
+        assert str(request.url) == "https://myweb.web.com/api/plate/check"
         return httpx.Response(200, json={"status": "NO", "owner": "خودرو غیرمجاز"})
 
     async def run() -> None:
@@ -258,7 +258,7 @@ def test_submit_violation_sends_to_api_and_logs_locally(tmp_path, monkeypatch) -
     def handler(request: httpx.Request) -> httpx.Response:
         import json
 
-        assert str(request.url) == "http://myweb.web.com/api/violation"
+        assert str(request.url) == "https://myweb.web.com/api/violation"
         captured_payload.update(json.loads(request.content.decode("utf-8")))
         return httpx.Response(200, json={"ok": True})
 
@@ -296,7 +296,7 @@ def test_submit_violation_with_evidence_photo_history_retry_and_delete(
     def handler(request: httpx.Request) -> httpx.Response:
         import json
 
-        assert str(request.url) == "http://myweb.web.com/api/violation"
+        assert str(request.url) == "https://myweb.web.com/api/violation"
         captured_payloads.append(json.loads(request.content.decode("utf-8")))
         if server_status == 200:
             return httpx.Response(200, json={"ok": True, "id": "srv-1"})

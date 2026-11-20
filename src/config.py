@@ -109,7 +109,7 @@ VIOLATION_TYPES: tuple[str, ...] = (
 class AppSettings:
     """تنظیمات قابل تغییر در زمان اجرا."""
 
-    api_base_url: str = "http://myweb.web.com"
+    api_base_url: str = "https://myweb.web.com"
     api_check_path: str = "/api/plate/check"
     api_violation_path: str = "/api/violation"
     api_timeout_seconds: float = 5.0
