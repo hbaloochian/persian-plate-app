@@ -32,18 +32,6 @@ from core.jalali import (
 
 logger = logging.getLogger(__name__)
 
-# حداکثر حجم مجاز پاسخ سرور (بایت). جلوگیری از پاسخ بسیار بزرگ که می‌تواند حافظه را بپوشاند.
-_MAX_RESPONSE_BYTES = 1_000_000  # یک مگابایت
-
-
-def _safe_error_text(exc: Exception) -> str:
-    """متن خطای خنثی‌سازی‌شده برای لاگ و ذخیره‌سازی محلی.
-
-    فقط نام کلاس خطا را نشان می‌دهد و از افشای متن کامل خطای حساسی
-    (مثل URLها یا محتوای پاسخ سرور) در لاگ و فایل محلی جلوگیری می‌کند.
-    """
-    return f"خطای شبکه ({type(exc).__name__})"
-
 
 class PlateCheckStatus(str, Enum):
     """وضعیت استعلام پلاک برای تعیین رنگ کادر دور پلاک."""
@@ -406,31 +394,13 @@ class PlateApiClient:
         if self._client is None or self._client.is_closed:
             self._client = httpx.AsyncClient(
                 timeout=httpx.Timeout(self.settings.api_timeout_seconds),
-                # لرزش‌ناپذیری: درخواست POST حساسی هرگز به سرور دیگری کشه‌ندهی نشود
-                follow_redirects=False,
-                # اعتبارسنجی صریح TLS (رمزنگاری سرور راستی‌سنجی شود، نه نادیده گرفته شود)
-                verify=True,
+                follow_redirects=True,
                 headers={
                     "Accept": "application/json, text/plain;q=0.9",
                     "User-Agent": "PersianPlateScanner/1.0-Android",
                 },
             )
         return self._client
-
-    def _require_https_base(self) -> bool:
-        """بررسی اجباری پروتکل HTTPS در آدرس پایه سرور.
-
-        در صورت عدم استفاده از `https://`، با هشدار درخواست را رد می‌کند تا
-        داده‌های حساسی (پلاک، GPS، تصاویر، پاسخ) هرگز به‌صورت متن‌کلا انتقال داده نشوند.
-        """
-        if not str(self.settings.api_base_url).lower().startswith("https://"):
-            logger.warning("Blocked API request: base URL does not use HTTPS.")
-            return False
-        return True
-
-    def _response_too_large(self, resp: httpx.Response) -> bool:
-        """بررسی حداکثر حجم پاسخ سرور."""
-        return len(resp.content) > _MAX_RESPONSE_BYTES
 
     def get_cached(self, plate_key: str) -> ApiCheckResult | None:
         """در صورت معتبر بودن کش برای این پلاک، نتیجه فوری برمی‌گرداند."""
@@ -524,29 +494,8 @@ class PlateApiClient:
         t0 = time.perf_counter()
         try:
             client = self._get_client()
-            if not self._require_https_base():
-                latency_ms = (time.perf_counter() - t0) * 1000.0
-                return ApiCheckResult(
-                    plate_persian=plate_persian,
-                    plate_latin=plate_latin,
-                    status=PlateCheckStatus.ERROR,
-                    raw_response="",
-                    latency_ms=latency_ms,
-                    checked_at=datetime.now().strftime("%H:%M:%S"),
-                    error_message="آدرس سرور باید از پروتکل HTTPS استفاده کند.",
-                )
             resp = await client.post(self.settings.check_url, json=payload)
             latency_ms = (time.perf_counter() - t0) * 1000.0
-            if self._response_too_large(resp):
-                return ApiCheckResult(
-                    plate_persian=plate_persian,
-                    plate_latin=plate_latin,
-                    status=PlateCheckStatus.ERROR,
-                    raw_response="",
-                    latency_ms=latency_ms,
-                    checked_at=datetime.now().strftime("%H:%M:%S"),
-                    error_message="پاسخ سرور بیش از حد بزرگ است.",
-                )
             return parse_server_plate_response(
                 status_code=resp.status_code,
                 response_text=resp.text,
@@ -567,7 +516,7 @@ class PlateApiClient:
             )
         except Exception as exc:
             latency_ms = (time.perf_counter() - t0) * 1000.0
-            logger.warning("API request error: %s", _safe_error_text(exc))
+            logger.warning("API request error: %s", exc)
             return ApiCheckResult(
                 plate_persian=plate_persian,
                 plate_latin=plate_latin,
@@ -575,7 +524,7 @@ class PlateApiClient:
                 raw_response="",
                 latency_ms=latency_ms,
                 checked_at=datetime.now().strftime("%H:%M:%S"),
-                error_message=_safe_error_text(exc),
+                error_message=f"خطا در اتصال به سرور: {exc}",
             )
 
     async def submit_violation(
@@ -660,24 +609,16 @@ class PlateApiClient:
         message = ""
         try:
             client = self._get_client()
-            if self._require_https_base():
-                resp = await client.post(self.settings.violation_url, json=payload)
-                if self._response_too_large(resp):
-                    server_response = ""
-                    message = "پاسخ سرور بیش از حد بزرگ است؛ تخلف به‌صورت محلی ذخیره شد."
-                else:
-                    server_response = resp.text.strip()
-                    if 200 <= resp.status_code < 300:
-                        synced = True
-                        message = "تخلف با موفقیت در سرور ثبت شد."
-                    else:
-                        message = f"خطای سرور هنگام ثبت تخلف (کد {resp.status_code}). نسخه محلی ذخیره شد."
+            resp = await client.post(self.settings.violation_url, json=payload)
+            server_response = resp.text.strip()
+            if 200 <= resp.status_code < 300:
+                synced = True
+                message = "تخلف با موفقیت در سرور ثبت شد."
             else:
-                server_response = ""
-                message = "آدرس سرور باید از پروتکل HTTPS استفاده کند؛ تخلف به‌صورت محلی ذخیره شد."
+                message = f"خطای سرور هنگام ثبت تخلف (کد {resp.status_code}). نسخه محلی ذخیره شد."
         except Exception as exc:
-            logger.warning("Failed to submit violation online: %s", _safe_error_text(exc))
-            server_response = _safe_error_text(exc)
+            logger.warning("Failed to submit violation online: %s", exc)
+            server_response = str(exc)
             message = "اتصال به سرور برقرار نشد؛ تخلف به‌صورت محلی روی گوشی ذخیره شد."
 
         record = ViolationRecord(
@@ -753,47 +694,31 @@ class PlateApiClient:
 
         try:
             client = self._get_client()
-            if self._require_https_base():
-                resp = await client.post(self.settings.violation_url, json=payload)
-                if self._response_too_large(resp):
-                    return ViolationSubmissionResult(
-                        success=False,
-                        message="پاسخ سرور بیش از حد بزرگ است.",
-                        saved_locally=True,
-                        server_response="",
-                        record_id=record.id,
-                    )
-                server_response = resp.text.strip()
-                if 200 <= resp.status_code < 300:
-                    update_violation_sync_status(record.id, synced=True, server_response=server_response)
-                    return ViolationSubmissionResult(
-                        success=True,
-                        message="تخلف با موفقیت به سرور ارسال و همگام‌سازی شد.",
-                        saved_locally=True,
-                        server_response=server_response,
-                        record_id=record.id,
-                    )
+            resp = await client.post(self.settings.violation_url, json=payload)
+            server_response = resp.text.strip()
+            if 200 <= resp.status_code < 300:
+                update_violation_sync_status(record.id, synced=True, server_response=server_response)
                 return ViolationSubmissionResult(
-                    success=False,
-                    message=f"سرور پاسخ خطا داد (کد {resp.status_code}).",
+                    success=True,
+                    message="تخلف با موفقیت به سرور ارسال و همگام‌سازی شد.",
                     saved_locally=True,
                     server_response=server_response,
                     record_id=record.id,
                 )
             return ViolationSubmissionResult(
                 success=False,
-                message="آدرس سرور باید از پروتکل HTTPS استفاده کند.",
+                message=f"سرور پاسخ خطا داد (کد {resp.status_code}).",
                 saved_locally=True,
-                server_response="",
+                server_response=server_response,
                 record_id=record.id,
             )
         except Exception as exc:
-            logger.warning("Retry violation sync failed: %s", _safe_error_text(exc))
+            logger.warning("Retry violation sync failed: %s", exc)
             return ViolationSubmissionResult(
                 success=False,
-                message="ارسال مجدد ناموفق بود.",
+                message=f"ارسال مجدد ناموفق بود: {exc}",
                 saved_locally=True,
-                server_response=_safe_error_text(exc),
+                server_response=str(exc),
                 record_id=record.id,
             )
 
