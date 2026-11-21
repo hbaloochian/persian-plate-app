@@ -92,6 +92,11 @@ class AppRuntimeState:
     is_paused: bool = False
     torch_on: bool = False
 
+    # سطح زوم زنده دوربین (برای تشخیص پلاک‌های دور) و محدوده مجاز دستگاه
+    camera_zoom: float = 1.0
+    zoom_min: float = 1.0
+    zoom_max: float = 1.0
+
     # ابعاد فعلی Canvas روی پیش‌نمایش دوربین
     canvas_width: float = 0.0
     canvas_height: float = 0.0
@@ -263,6 +268,26 @@ async def main(page: ft.Page) -> None:
         tooltip="تنظیمات سرور و استعلام خودکار",
         icon_size=22,
     )
+    zoom_out_btn = ft.IconButton(
+        icon=ft.Icons.ZOOM_OUT,
+        icon_color=ft.Colors.WHITE,
+        tooltip="کم کردن زوم تصویر زنده",
+        icon_size=22,
+        disabled=True,
+    )
+    zoom_in_btn = ft.IconButton(
+        icon=ft.Icons.ZOOM_IN,
+        icon_color=ft.Colors.WHITE,
+        tooltip="افزایش زوم تصویر زنده (برای پلاک‌های دور)",
+        icon_size=22,
+        disabled=True,
+    )
+    hud_zoom_text = ft.Text(
+        "زوم: ۱.۰×",
+        size=11,
+        color=ft.Colors.LIGHT_BLUE_200,
+        weight=ft.FontWeight.BOLD,
+    )
 
     camera_placeholder_text = ft.Text(
         "در حال راه‌اندازی دوربین...",
@@ -333,12 +358,20 @@ async def main(page: ft.Page) -> None:
                         hud_status_text,
                         ft.Text("|", color=ft.Colors.WHITE_38),
                         hud_fps_text,
+                        ft.Text("|", color=ft.Colors.WHITE_38),
+                        hud_zoom_text,
                     ],
                 ),
                 ft.Row(
                     spacing=0,
                     tight=True,
-                    controls=[flash_btn, pause_btn, settings_btn],
+                    controls=[
+                        flash_btn,
+                        pause_btn,
+                        settings_btn,
+                        zoom_out_btn,
+                        zoom_in_btn,
+                    ],
                 ),
             ],
         ),
@@ -1877,8 +1910,35 @@ async def main(page: ft.Page) -> None:
         except Exception as exc:
             logger.warning("Flash toggle unsupported: %s", exc)
 
+    async def _apply_zoom(new_zoom: float) -> None:
+        """زوم فعلی را به محدوده دستگاه محدود، اعمال و در HUD نمایش می‌دهد."""
+        zoom = max(state.zoom_min, min(state.zoom_max, float(new_zoom)))
+        state.camera_zoom = zoom
+        try:
+            await camera_control.set_zoom_level(zoom)
+        except Exception as exc:
+            logger.warning("set_zoom_level failed: %s", exc)
+        hud_zoom_text.value = to_persian_digits(f"زوم: {zoom:.1f}×")
+        hud_zoom_text.update()
+        zoom_in_btn.disabled = zoom >= state.zoom_max - 1e-6
+        zoom_out_btn.disabled = zoom <= state.zoom_min + 1e-6
+        zoom_in_btn.update()
+        zoom_out_btn.update()
+
+    async def zoom_in(_e=None) -> None:
+        if not state.is_camera_ready:
+            return
+        await _apply_zoom(state.camera_zoom + 0.5)
+
+    async def zoom_out(_e=None) -> None:
+        if not state.is_camera_ready:
+            return
+        await _apply_zoom(state.camera_zoom - 0.5)
+
     pause_btn.on_click = toggle_pause
     flash_btn.on_click = toggle_flash
+    zoom_in_btn.on_click = zoom_in
+    zoom_out_btn.on_click = zoom_out
 
     # -----------------------------------------------------------------------
     # حالت تست شبیه‌سازی برای اجرا روی کامپیوتر (دسکتاپ) بدون دوربین اندروید
@@ -2000,6 +2060,23 @@ async def main(page: ft.Page) -> None:
 
             state.is_camera_ready = True
             camera_fallback_overlay.visible = False
+
+            # اولیه‌سازی محدوده زوم تصویر زنده از دوربین و فعال‌سازی دکمه‌های زوم
+            try:
+                state.zoom_min = float(await camera_control.get_min_zoom_level())
+            except Exception:
+                state.zoom_min = 1.0
+            try:
+                state.zoom_max = float(await camera_control.get_max_zoom_level())
+            except Exception:
+                state.zoom_max = max(1.0, state.zoom_min)
+            state.camera_zoom = state.zoom_min
+            zoom_in_btn.disabled = state.camera_zoom >= state.zoom_max - 1e-6
+            zoom_out_btn.disabled = state.camera_zoom <= state.zoom_min + 1e-6
+            hud_zoom_text.value = to_persian_digits(f"زوم: {state.camera_zoom:.1f}×")
+            zoom_in_btn.update()
+            zoom_out_btn.update()
+            hud_zoom_text.update()
 
             if await camera_control.supports_image_streaming():
                 await camera_control.start_image_stream()
